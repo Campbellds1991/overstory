@@ -466,6 +466,123 @@ describe("daemon tick", () => {
 		expect(reloaded[0]?.stalledSince).not.toBeNull();
 	});
 
+	test("first stalled unread-mail nudge is one-shot and does not jump escalation", async () => {
+		const staleActivity = new Date(Date.now() - 60_000).toISOString();
+		const session = makeSession({
+			agentName: "mail-once-agent",
+			tmuxSession: "overstory-mail-once-agent",
+			state: "working",
+			lastActivity: staleActivity,
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+		seedUnreadMail(tempRoot, "mail-once-agent", {
+			subject: "Pending review",
+			body: "Please check inbox.",
+		});
+
+		const tmuxMock = tmuxWithLiveness({ "overstory-mail-once-agent": true });
+		const nudgeMock = nudgeTracker();
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			nudgeIntervalMs: 60_000,
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_nudge: nudgeMock.nudge,
+		});
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			nudgeIntervalMs: 60_000,
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_nudge: nudgeMock.nudge,
+		});
+
+		const unreadMailNudges = nudgeMock.calls.filter((c) => c.message.includes("unread mail"));
+		const escalationNudges = nudgeMock.calls.filter((c) => c.message.includes("appears stalled"));
+
+		expect(unreadMailNudges).toHaveLength(1);
+		expect(unreadMailNudges[0]?.agentName).toBe("mail-once-agent");
+		expect(escalationNudges).toHaveLength(0);
+
+		const reloaded = readSessionsFromStore(tempRoot);
+		expect(reloaded).toHaveLength(1);
+		expect(reloaded[0]?.state).toBe("stalled");
+		expect(reloaded[0]?.escalationLevel).toBe(0);
+		expect(reloaded[0]?.stalledSince).not.toBeNull();
+		expect(tmuxMock.killed).toHaveLength(0);
+	});
+
+	test("pending unread mail does not alter escalation boundaries after first stall", async () => {
+		const staleActivity = new Date(Date.now() - 60_000).toISOString();
+		const stalledSince = new Date(Date.now() - 70_000).toISOString();
+		const sessions: AgentSession[] = [
+			makeSession({
+				id: "pending-mail-session",
+				agentName: "pending-mail-agent",
+				tmuxSession: "overstory-pending-mail-agent",
+				state: "stalled",
+				lastActivity: staleActivity,
+				escalationLevel: 0,
+				stalledSince,
+			}),
+			makeSession({
+				id: "no-mail-session",
+				agentName: "no-mail-agent",
+				tmuxSession: "overstory-no-mail-agent",
+				state: "stalled",
+				lastActivity: staleActivity,
+				escalationLevel: 0,
+				stalledSince,
+			}),
+		];
+
+		writeSessionsToStore(tempRoot, sessions);
+		seedUnreadMail(tempRoot, "pending-mail-agent", {
+			subject: "Unread task",
+			body: "Follow up required.",
+		});
+
+		const tmuxMock = tmuxWithLiveness({
+			"overstory-pending-mail-agent": true,
+			"overstory-no-mail-agent": true,
+		});
+		const nudgeMock = nudgeTracker();
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			nudgeIntervalMs: 60_000,
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_nudge: nudgeMock.nudge,
+		});
+
+		const reloaded = readSessionsFromStore(tempRoot);
+		const pending = reloaded.find((s) => s.agentName === "pending-mail-agent");
+		const noMail = reloaded.find((s) => s.agentName === "no-mail-agent");
+
+		expect(pending).toBeDefined();
+		expect(noMail).toBeDefined();
+		expect(pending?.state).toBe("stalled");
+		expect(noMail?.state).toBe("stalled");
+		expect(pending?.escalationLevel).toBe(1);
+		expect(noMail?.escalationLevel).toBe(1);
+
+		expect(nudgeMock.calls).toHaveLength(2);
+		const nudgedAgents = nudgeMock.calls.map((c) => c.agentName).sort();
+		expect(nudgedAgents).toEqual(["no-mail-agent", "pending-mail-agent"]);
+		for (const call of nudgeMock.calls) {
+			expect(call.message).toContain("appears stalled");
+			expect(call.message).not.toContain("unread mail");
+		}
+		expect(tmuxMock.killed).toHaveLength(0);
+	});
+
 	test("stalled agent at level 1 sends nudge", async () => {
 		const staleActivity = new Date(Date.now() - 60_000).toISOString();
 		// Pre-set stalledSince to > nudgeIntervalMs ago so level advances to 1

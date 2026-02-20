@@ -15,6 +15,7 @@ import { createMailStore } from "../mail/store.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import type { StoredEvent } from "../types.ts";
 import { mailCommand } from "./mail.ts";
+import { runDaemonTick } from "../watchdog/daemon.ts";
 
 describe("mailCommand", () => {
 	let tempDir: string;
@@ -319,6 +320,150 @@ describe("mailCommand", () => {
 			expect(output).toContain("Wake nudge");
 			expect(output).toContain("No unread messages were found after wake signal.");
 			expect(await Bun.file(markerPath).exists()).toBe(false);
+		});
+
+		test("watchdog first-stall unread-mail nudge can wake wait without escalation jumps", async () => {
+			const sessionsDbPath = join(tempDir, ".overstory", "sessions.db");
+			const staleActivity = new Date(Date.now() - 60_000).toISOString();
+			const markerPath = join(tempDir, ".overstory", "pending-nudges", "builder-1.json");
+
+			const sessionStore = createSessionStore(sessionsDbPath);
+			sessionStore.upsert({
+				id: "session-builder-1-watchdog-wait",
+				agentName: "builder-1",
+				capability: "builder",
+				worktreePath: "/worktrees/builder-1",
+				branchName: "builder-1",
+				beadId: "bead-watchdog-wait",
+				tmuxSession: "overstory-test-builder-1",
+				state: "working",
+				pid: 12399,
+				parentAgent: "orchestrator",
+				depth: 1,
+				runId: "run-watchdog-mail",
+				startedAt: staleActivity,
+				lastActivity: staleActivity,
+				escalationLevel: 0,
+				stalledSince: null,
+			});
+			sessionStore.close();
+
+			await runDaemonTick({
+				root: tempDir,
+				staleThresholdMs: 30_000,
+				zombieThresholdMs: 120_000,
+				nudgeIntervalMs: 60_000,
+				_tmux: {
+					isSessionAlive: async () => true,
+					killSession: async () => {},
+				},
+				_triage: async () => "extend",
+				_nudge: async (projectRoot, agentName) => {
+					const markerDir = join(projectRoot, ".overstory", "pending-nudges");
+					await mkdir(markerDir, { recursive: true });
+					await Bun.write(
+						join(markerDir, `${agentName}.json`),
+						`${JSON.stringify(
+							{
+								from: "watchdog",
+								reason: "unread mail",
+								subject: "Check inbox",
+								messageId: "msg-watchdog-wake",
+								createdAt: new Date().toISOString(),
+							},
+							null,
+							"\t",
+						)}\n`,
+					);
+					return { delivered: true };
+				},
+			});
+
+			expect(await Bun.file(markerPath).exists()).toBe(true);
+
+			output = "";
+			await mailCommand(["wait", "--agent", "builder-1", "--timeout", "80", "--poll", "1"]);
+
+			expect(output).toContain("Mail wait woke");
+			expect(output).toContain("Wake nudge");
+			expect(output).toContain("Build task");
+			expect(await Bun.file(markerPath).exists()).toBe(false);
+
+			const sessionStore2 = createSessionStore(sessionsDbPath);
+			const updated = sessionStore2.getByName("builder-1");
+			sessionStore2.close();
+
+			expect(updated).toBeTruthy();
+			expect(updated?.state).toBe("working");
+			expect(updated?.escalationLevel).toBe(0);
+			expect(updated?.stalledSince).toBeNull();
+		});
+
+		test("wait timeout heartbeat prevents false watchdog escalation", async () => {
+			const sessionsDbPath = join(tempDir, ".overstory", "sessions.db");
+			const staleActivity = new Date(Date.now() - 60_000).toISOString();
+			const nudgeCalls: Array<{ agentName: string; message: string }> = [];
+
+			const sessionStore = createSessionStore(sessionsDbPath);
+			sessionStore.upsert({
+				id: "session-no-mail-watchdog",
+				agentName: "no-mail-watchdog",
+				capability: "builder",
+				worktreePath: "/worktrees/no-mail-watchdog",
+				branchName: "no-mail-watchdog",
+				beadId: "bead-no-mail-watchdog",
+				tmuxSession: "overstory-test-no-mail-watchdog",
+				state: "working",
+				pid: 12400,
+				parentAgent: "orchestrator",
+				depth: 1,
+				runId: "run-watchdog-mail",
+				startedAt: staleActivity,
+				lastActivity: staleActivity,
+				escalationLevel: 0,
+				stalledSince: null,
+			});
+			sessionStore.close();
+
+			output = "";
+			await mailCommand([
+				"wait",
+				"--agent",
+				"no-mail-watchdog",
+				"--timeout",
+				"25",
+				"--poll",
+				"1",
+				"--status-every",
+				"50",
+			]);
+			expect(output).toContain("Timed out waiting for mail");
+
+			await runDaemonTick({
+				root: tempDir,
+				staleThresholdMs: 30_000,
+				zombieThresholdMs: 120_000,
+				nudgeIntervalMs: 60_000,
+				_tmux: {
+					isSessionAlive: async () => true,
+					killSession: async () => {},
+				},
+				_triage: async () => "extend",
+				_nudge: async (_projectRoot, agentName, message) => {
+					nudgeCalls.push({ agentName, message });
+					return { delivered: true };
+				},
+			});
+
+			const sessionStore2 = createSessionStore(sessionsDbPath);
+			const updated = sessionStore2.getByName("no-mail-watchdog");
+			sessionStore2.close();
+
+			expect(nudgeCalls).toHaveLength(0);
+			expect(updated).toBeTruthy();
+			expect(updated?.state).toBe("working");
+			expect(updated?.escalationLevel).toBe(0);
+			expect(updated?.stalledSince).toBeNull();
 		});
 	});
 
