@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentError } from "../errors.ts";
+import type { HookProviderKind } from "./hooks-policy.ts";
 import {
 	buildBashFileGuardScript,
 	buildBashPathBoundaryScript,
@@ -1730,5 +1731,98 @@ describe("bash path boundary integration", () => {
 		);
 		expect(universalGuard).toBeDefined();
 		expect(universalGuard.hooks[0].command).toContain('"decision":"block"');
+	});
+});
+
+describe("provider hook parity regression matrix", () => {
+	let tempDir: string;
+
+	type ParsedHookEntry = {
+		matcher: string;
+		hooks: Array<{ type: string; command: string }>;
+	};
+
+	const providerKinds: HookProviderKind[] = ["native", "gateway"];
+	const capabilities = [
+		"builder",
+		"scout",
+		"reviewer",
+		"lead",
+		"merger",
+		"coordinator",
+		"supervisor",
+		"monitor",
+	];
+
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), "overstory-provider-parity-"));
+	});
+
+	afterEach(async () => {
+		await rm(tempDir, { recursive: true, force: true });
+	});
+
+	test("capability guard structure is identical across native and gateway providers", async () => {
+		for (const capability of capabilities) {
+			let nativeHooks: Record<string, ParsedHookEntry[]> | null = null;
+			let gatewayHooks: Record<string, ParsedHookEntry[]> | null = null;
+
+			for (const providerKind of providerKinds) {
+				const worktreePath = join(tempDir, `${capability}-${providerKind}-wt`);
+				await deployHooks(worktreePath, `${capability}-parity-agent`, capability, {
+					providerKind,
+				});
+
+				const outputPath = join(worktreePath, ".claude", "settings.local.json");
+				const content = await Bun.file(outputPath).text();
+				const parsed = JSON.parse(content) as { hooks: Record<string, ParsedHookEntry[]> };
+
+				if (providerKind === "native") {
+					nativeHooks = parsed.hooks;
+				} else {
+					gatewayHooks = parsed.hooks;
+				}
+			}
+
+			expect(nativeHooks).toEqual(gatewayHooks);
+		}
+	});
+
+	test("stdin logging + event hook behavior is provider-parity safe", async () => {
+		for (const providerKind of providerKinds) {
+			const worktreePath = join(tempDir, `stdin-${providerKind}-wt`);
+			await deployHooks(worktreePath, `stdin-${providerKind}-agent`, "builder", {
+				providerKind,
+			});
+
+			const outputPath = join(worktreePath, ".claude", "settings.local.json");
+			const content = await Bun.file(outputPath).text();
+			const parsed = JSON.parse(content) as { hooks: Record<string, ParsedHookEntry[]> };
+
+			const preBase = parsed.hooks.PreToolUse?.find((entry) => entry.matcher === "");
+			const postBase = parsed.hooks.PostToolUse?.find((entry) => entry.matcher === "");
+			const stopBase = parsed.hooks.Stop?.find((entry) => entry.matcher === "");
+
+			expect(preBase).toBeDefined();
+			expect(postBase).toBeDefined();
+			expect(stopBase).toBeDefined();
+			expect(preBase?.hooks[0]?.command).toContain("overstory log tool-start");
+			expect(preBase?.hooks[0]?.command).toContain("--stdin");
+			expect(postBase?.hooks[0]?.command).toContain("overstory log tool-end");
+			expect(postBase?.hooks[0]?.command).toContain("--stdin");
+			expect(stopBase?.hooks[0]?.command).toContain("overstory log session-end");
+			expect(stopBase?.hooks[0]?.command).toContain("--stdin");
+
+			for (const hookTypeEntries of Object.values(parsed.hooks)) {
+				for (const entry of hookTypeEntries) {
+					for (const hook of entry.hooks) {
+						if (hook.command.includes("overstory log")) {
+							expect(hook.command).toContain("--stdin");
+							expect(hook.command).not.toContain("--tool-name");
+						}
+					}
+				}
+			}
+		}
 	});
 });
