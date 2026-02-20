@@ -77,6 +77,30 @@ function getPositionalArgs(args: string[]): string[] {
 	return positional;
 }
 
+/**
+ * Resolve an agent name with fallback order:
+ * 1) explicit flag(s), in the order provided
+ * 2) OVERSTORY_AGENT_NAME environment variable
+ * 3) fallback value (default: orchestrator)
+ */
+function resolveAgentName(
+	args: string[],
+	flags: readonly string[],
+	fallback: string = "orchestrator",
+): string {
+	for (const flag of flags) {
+		const value = getFlag(args, flag)?.trim();
+		if (value && value.length > 0) {
+			return value;
+		}
+	}
+	const envAgent = process.env.OVERSTORY_AGENT_NAME?.trim();
+	if (envAgent && envAgent.length > 0) {
+		return envAgent;
+	}
+	return fallback;
+}
+
 /** Format a single message for human-readable output. */
 function formatMessage(msg: MailMessage): string {
 	const readMarker = msg.read ? " " : "*";
@@ -255,12 +279,49 @@ function openClient(cwd: string) {
 	return client;
 }
 
+/**
+ * Refresh an agent's session heartbeat for mail activity.
+ *
+ * Keeps waiting/checking agents from being falsely marked stalled by watchdog.
+ * Non-fatal: never throws.
+ */
+function refreshSessionHeartbeat(cwd: string, agentName: string): void {
+	const normalized = agentName.trim();
+	if (normalized.length === 0) {
+		return;
+	}
+	try {
+		const overstoryDir = join(cwd, ".overstory");
+		const { store } = openSessionStore(overstoryDir);
+		try {
+			const session = store.getByName(normalized);
+			if (!session) {
+				return;
+			}
+			if (session.state === "completed" || session.state === "zombie") {
+				return;
+			}
+			store.updateLastActivity(normalized);
+			if (session.state === "booting" || session.state === "stalled") {
+				store.updateState(normalized, "working");
+			}
+			if (session.stalledSince !== null || session.escalationLevel > 0) {
+				store.updateEscalation(normalized, 0, null);
+			}
+		} finally {
+			store.close();
+		}
+	} catch {
+		// Non-fatal: activity refresh must not block mail commands
+	}
+}
+
 /** overstory mail send */
 async function handleSend(args: string[], cwd: string): Promise<void> {
 	const to = getFlag(args, "--to");
 	const subject = getFlag(args, "--subject");
 	const body = getFlag(args, "--body");
-	const from = getFlag(args, "--agent") ?? getFlag(args, "--from") ?? "orchestrator";
+	const from = resolveAgentName(args, ["--agent", "--from"]);
 	const rawPayload = getFlag(args, "--payload");
 	const VALID_PRIORITIES = ["low", "normal", "high", "urgent"] as const;
 
@@ -306,6 +367,8 @@ async function handleSend(args: string[], cwd: string): Promise<void> {
 	if (!body) {
 		throw new ValidationError("--body is required for mail send", { field: "body" });
 	}
+
+	refreshSessionHeartbeat(cwd, from);
 
 	// Handle broadcast messages (group addresses)
 	if (isGroupAddress(to)) {
@@ -508,10 +571,12 @@ async function handleSend(args: string[], cwd: string): Promise<void> {
 
 /** overstory mail check */
 async function handleCheck(args: string[], cwd: string): Promise<void> {
-	const agent = getFlag(args, "--agent") ?? "orchestrator";
+	const agent = resolveAgentName(args, ["--agent"]);
 	const inject = hasFlag(args, "--inject");
 	const json = hasFlag(args, "--json");
 	const debounceFlag = getFlag(args, "--debounce");
+
+	refreshSessionHeartbeat(cwd, agent);
 
 	// Parse debounce interval if provided
 	let debounceMs: number | undefined;
@@ -577,8 +642,199 @@ async function handleCheck(args: string[], cwd: string): Promise<void> {
 	}
 }
 
+/**
+ * Parse a non-negative integer flag value with validation.
+ */
+function parseNonNegativeIntFlag(args: string[], flag: string, defaultValue: number): number {
+	const raw = getFlag(args, flag);
+	if (raw === undefined) {
+		return defaultValue;
+	}
+	const parsed = Number.parseInt(raw, 10);
+	if (Number.isNaN(parsed) || parsed < 0) {
+		throw new ValidationError(`${flag} must be a non-negative integer, got: ${raw}`, {
+			field: flag.replace(/^--/, ""),
+			value: raw,
+		});
+	}
+	return parsed;
+}
+
+/**
+ * Parse a positive integer flag value with validation.
+ */
+function parsePositiveIntFlag(args: string[], flag: string, defaultValue: number): number {
+	const raw = getFlag(args, flag);
+	if (raw === undefined) {
+		return defaultValue;
+	}
+	const parsed = Number.parseInt(raw, 10);
+	if (Number.isNaN(parsed) || parsed <= 0) {
+		throw new ValidationError(`${flag} must be a positive integer, got: ${raw}`, {
+			field: flag.replace(/^--/, ""),
+			value: raw,
+		});
+	}
+	return parsed;
+}
+
+/**
+ * Parse a backoff factor flag value with validation.
+ */
+function parseBackoffFlag(args: string[], defaultValue: number): number {
+	const raw = getFlag(args, "--backoff");
+	if (raw === undefined) {
+		return defaultValue;
+	}
+	const parsed = Number.parseFloat(raw);
+	if (!Number.isFinite(parsed) || parsed < 1) {
+		throw new ValidationError(`--backoff must be a number >= 1, got: ${raw}`, {
+			field: "backoff",
+			value: raw,
+		});
+	}
+	return parsed;
+}
+
+/** overstory mail wait */
+async function handleWait(args: string[], cwd: string): Promise<void> {
+	const json = hasFlag(args, "--json");
+	const agent = resolveAgentName(args, ["--agent"]);
+	const timeoutMs = parseNonNegativeIntFlag(args, "--timeout", 300_000);
+	const initialPollMs = parsePositiveIntFlag(args, "--poll", 250);
+	const maxPollMs = parsePositiveIntFlag(args, "--max-poll", 5_000);
+	const statusEveryMs = parsePositiveIntFlag(args, "--status-every", 5_000);
+	const backoff = parseBackoffFlag(args, 1.5);
+
+	if (maxPollMs < initialPollMs) {
+		throw new ValidationError("--max-poll must be greater than or equal to --poll", {
+			field: "max-poll",
+			value: String(maxPollMs),
+		});
+	}
+
+	let cancelled = false;
+	const onCancel = (): void => {
+		cancelled = true;
+	};
+	process.on("SIGINT", onCancel);
+	process.on("SIGTERM", onCancel);
+
+	const startedAt = Date.now();
+	let nextStatusAt = startedAt;
+	let pollMs = initialPollMs;
+
+	const client = openClient(cwd);
+	try {
+		refreshSessionHeartbeat(cwd, agent);
+
+		if (!json) {
+			process.stdout.write(
+				`⏳ Waiting for mail for "${agent}" (timeout=${timeoutMs}ms, poll=${initialPollMs}ms→${maxPollMs}ms, backoff=${backoff}x). Press Ctrl-C to cancel.\n`,
+			);
+		}
+
+		while (true) {
+			const elapsedMs = Date.now() - startedAt;
+			if (cancelled) {
+				if (json) {
+					process.stdout.write(
+						`${JSON.stringify({
+							status: "cancelled",
+							agent,
+							waitedMs: elapsedMs,
+							messageCount: 0,
+						})}\n`,
+					);
+				} else {
+					process.stdout.write(`🛑 Mail wait cancelled after ${elapsedMs}ms.\n`);
+				}
+				return;
+			}
+
+			const pendingNudge = await readAndClearPendingNudge(cwd, agent);
+			const messages = client.check(agent);
+			if (messages.length > 0 || pendingNudge !== null) {
+				refreshSessionHeartbeat(cwd, agent);
+
+				if (json) {
+					process.stdout.write(
+						`${JSON.stringify({
+							status: "received",
+							agent,
+							waitedMs: Date.now() - startedAt,
+							messageCount: messages.length,
+							wake: pendingNudge,
+							messages,
+						})}\n`,
+					);
+				} else {
+					process.stdout.write(`✅ Mail wait woke after ${Date.now() - startedAt}ms.\n`);
+					if (pendingNudge) {
+						process.stdout.write(
+							`🚨 Wake nudge: ${pendingNudge.reason} from ${pendingNudge.from} — "${pendingNudge.subject}"\n`,
+						);
+					}
+					if (messages.length === 0) {
+						process.stdout.write("No unread messages were found after wake signal.\n");
+					} else {
+						process.stdout.write(
+							`📬 ${messages.length} new message${messages.length === 1 ? "" : "s"}:\n\n`,
+						);
+						for (const msg of messages) {
+							process.stdout.write(`${formatMessage(msg)}\n\n`);
+						}
+					}
+				}
+				return;
+			}
+
+			if (elapsedMs >= timeoutMs) {
+				if (json) {
+					process.stdout.write(
+						`${JSON.stringify({
+							status: "timeout",
+							agent,
+							waitedMs: elapsedMs,
+							messageCount: 0,
+						})}\n`,
+					);
+				} else {
+					process.stdout.write(
+						`⌛ Timed out waiting for mail for "${agent}" after ${elapsedMs}ms.\n`,
+					);
+				}
+				return;
+			}
+
+			const now = Date.now();
+			if (!json && now >= nextStatusAt) {
+				const remainingMs = Math.max(timeoutMs - (now - startedAt), 0);
+				process.stdout.write(
+					`… still waiting (elapsed=${now - startedAt}ms, remaining=${remainingMs}ms, next-poll=${pollMs}ms)\n`,
+				);
+				nextStatusAt = now + statusEveryMs;
+			}
+
+			const remainingMs = Math.max(timeoutMs - (Date.now() - startedAt), 0);
+			const sleepMs = Math.min(pollMs, remainingMs);
+			if (sleepMs > 0) {
+				await Bun.sleep(sleepMs);
+			}
+			refreshSessionHeartbeat(cwd, agent);
+			pollMs = Math.min(maxPollMs, Math.max(1, Math.round(pollMs * backoff)));
+		}
+	} finally {
+		client.close();
+		process.off("SIGINT", onCancel);
+		process.off("SIGTERM", onCancel);
+	}
+}
+
 /** overstory mail list */
 function handleList(args: string[], cwd: string): void {
+	refreshSessionHeartbeat(cwd, resolveAgentName(args, []));
+
 	const from = getFlag(args, "--from");
 	// --agent is an alias for --to, providing agent-scoped perspective (like mail check)
 	const to = getFlag(args, "--to") ?? getFlag(args, "--agent");
@@ -608,6 +864,8 @@ function handleList(args: string[], cwd: string): void {
 
 /** overstory mail read */
 function handleRead(args: string[], cwd: string): void {
+	refreshSessionHeartbeat(cwd, resolveAgentName(args, ["--agent"]));
+
 	const positional = getPositionalArgs(args);
 	const id = positional[0];
 	if (!id) {
@@ -632,7 +890,7 @@ function handleReply(args: string[], cwd: string): void {
 	const positional = getPositionalArgs(args);
 	const id = positional[0];
 	const body = getFlag(args, "--body");
-	const from = getFlag(args, "--agent") ?? getFlag(args, "--from") ?? "orchestrator";
+	const from = resolveAgentName(args, ["--agent", "--from"]);
 
 	if (!id) {
 		throw new ValidationError("Message ID is required for mail reply", { field: "id" });
@@ -640,6 +898,8 @@ function handleReply(args: string[], cwd: string): void {
 	if (!body) {
 		throw new ValidationError("--body is required for mail reply", { field: "body" });
 	}
+
+	refreshSessionHeartbeat(cwd, from);
 
 	const client = openClient(cwd);
 	try {
@@ -657,6 +917,8 @@ function handleReply(args: string[], cwd: string): void {
 
 /** overstory mail purge */
 function handlePurge(args: string[], cwd: string): void {
+	refreshSessionHeartbeat(cwd, resolveAgentName(args, []));
+
 	const all = hasFlag(args, "--all");
 	const daysStr = getFlag(args, "--days");
 	const agent = getFlag(args, "--agent");
@@ -715,6 +977,9 @@ Subcommands:
                   escalation, health_check, dispatch, assign (protocol)
   check    Check inbox (unread messages)
              [--agent <name>] [--inject] [--json]
+  wait     Wait for new messages with polling/backoff
+             [--agent <name>] [--timeout <ms>] [--poll <ms>]
+             [--max-poll <ms>] [--backoff <factor>] [--status-every <ms>] [--json]
   list     List messages with filters
              [--from <name>] [--to <name>] [--agent <name> (alias for --to)]
              [--unread] [--json]
@@ -751,6 +1016,9 @@ export async function mailCommand(args: string[]): Promise<void> {
 		case "check":
 			await handleCheck(subArgs, root);
 			break;
+		case "wait":
+			await handleWait(subArgs, root);
+			break;
 		case "list":
 			handleList(subArgs, root);
 			break;
@@ -765,7 +1033,7 @@ export async function mailCommand(args: string[]): Promise<void> {
 			break;
 		default:
 			throw new MailError(
-				`Unknown mail subcommand: ${subcommand ?? "(none)"}. Use: send, check, list, read, reply, purge`,
+				`Unknown mail subcommand: ${subcommand ?? "(none)"}. Use: send, check, wait, list, read, reply, purge`,
 			);
 	}
 }

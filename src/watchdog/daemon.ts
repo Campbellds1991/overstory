@@ -20,9 +20,12 @@
  * truth. See health.ts for the full ZFC documentation.
  */
 
+import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { createBeadsClient } from "../beads/client.ts";
 import { nudgeAgent } from "../commands/nudge.ts";
 import { createEventStore } from "../events/store.ts";
+import { createMailStore } from "../mail/store.ts";
 import { createMulchClient } from "../mulch/client.ts";
 import { openSessionStore } from "../sessions/compat.ts";
 import type { AgentSession, EventStore, HealthCheck } from "../types.ts";
@@ -38,6 +41,96 @@ const MAX_ESCALATION_LEVEL = 3;
  * These agents are long-running and should not count toward "all workers done".
  */
 const PERSISTENT_CAPABILITIES = new Set(["coordinator", "monitor"]);
+
+/** Bead statuses that indicate work is fully closed. */
+const CLOSED_BEAD_STATUSES = new Set(["closed", "done", "completed", "resolved"]);
+
+/**
+ * Check whether bead polling should be enabled for this root.
+ *
+ * Watchdog should only shell out to `bd` when running from an authoritative
+ * project workspace that also has a bead workspace initialized.
+ */
+function hasAuthoritativeBeadWorkspace(root: string): boolean {
+	const overstoryDir = join(root, ".overstory");
+	const beadsDir = join(root, ".beads");
+	return existsSync(overstoryDir) && existsSync(beadsDir);
+}
+
+/**
+ * Read unread mail count for an agent from mail.db.
+ * Non-fatal: returns 0 on failure.
+ */
+function getUnreadMailCount(overstoryDir: string, agentName: string): number {
+	const mailDbPath = join(overstoryDir, "mail.db");
+	let store: ReturnType<typeof createMailStore> | null = null;
+	try {
+		store = createMailStore(mailDbPath);
+		return store.getUnread(agentName).length;
+	} catch {
+		return 0;
+	} finally {
+		if (store) {
+			try {
+				store.close();
+			} catch {
+				// Non-fatal
+			}
+		}
+	}
+}
+
+/**
+ * Minimal bead status reader used by watchdog for linked-bead completion checks.
+ */
+type BeadStatusReader = {
+	show: (id: string) => Promise<{ status: string }>;
+};
+
+/**
+ * Resolve a bead status reader.
+ *
+ * Uses injected reader in tests. In production, only enables bd-backed checks
+ * when `bd` appears on PATH; otherwise returns null and skips bead polling.
+ */
+function resolveBeadStatusReader(
+	root: string,
+	injected: BeadStatusReader | null | undefined,
+): BeadStatusReader | null {
+	if (injected !== undefined) {
+		return injected;
+	}
+
+	const bunWithWhich = Bun as unknown as { which?: (cmd: string) => string | null };
+	const hasBd = bunWithWhich.which ? bunWithWhich.which("bd") !== null : true;
+	if (!hasBd) {
+		return null;
+	}
+	if (!hasAuthoritativeBeadWorkspace(root)) {
+		return null;
+	}
+
+	return createBeadsClient(root);
+}
+
+/**
+ * Read bead status safely. Returns null on errors.
+ */
+async function readBeadStatus(beads: BeadStatusReader, beadId: string): Promise<string | null> {
+	try {
+		const bead = await beads.show(beadId);
+		return bead.status;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Check whether a bead status is considered closed.
+ */
+function isClosedBeadStatus(status: string): boolean {
+	return CLOSED_BEAD_STATUSES.has(status.toLowerCase());
+}
 
 /**
  * Record an agent failure to mulch for future reference.
@@ -282,6 +375,8 @@ export interface DaemonOptions {
 		tier: 0 | 1,
 		triageSuggestion?: string,
 	) => Promise<void>;
+	/** Dependency injection for testing. Uses bd CLI when available if omitted. */
+	_beads?: BeadStatusReader | null;
 }
 
 /**
@@ -345,6 +440,7 @@ export async function runDaemonTick(options: DaemonOptions): Promise<void> {
 	const triage = options._triage ?? triageAgent;
 	const nudge = options._nudge ?? nudgeAgent;
 	const recordFailureFn = options._recordFailure ?? recordFailure;
+	const beads = resolveBeadStatusReader(root, options._beads);
 
 	const overstoryDir = join(root, ".overstory");
 	const { store } = openSessionStore(overstoryDir);
@@ -381,6 +477,38 @@ export async function runDaemonTick(options: DaemonOptions): Promise<void> {
 			// Skip completed sessions — they are terminal and don't need monitoring
 			if (session.state === "completed") {
 				continue;
+			}
+
+			// Auto-complete worker sessions when their linked bead is closed.
+			// This lets watchdog converge state even when hook-based session-end
+			// transitions were missed.
+			if (
+				beads &&
+				session.state !== "zombie" &&
+				!PERSISTENT_CAPABILITIES.has(session.capability)
+			) {
+				const beadStatus = await readBeadStatus(beads, session.beadId);
+				if (beadStatus !== null && isClosedBeadStatus(beadStatus)) {
+					store.updateState(session.agentName, "completed");
+					store.updateLastActivity(session.agentName);
+					store.updateEscalation(session.agentName, 0, null);
+					session.state = "completed";
+					session.escalationLevel = 0;
+					session.stalledSince = null;
+
+					recordEvent(eventStore, {
+						runId,
+						agentName: session.agentName,
+						eventType: "custom",
+						level: "info",
+						data: {
+							type: "bead_closed_auto_complete",
+							beadId: session.beadId,
+							beadStatus,
+						},
+					});
+					continue;
+				}
 			}
 
 			// ZFC: Don't skip zombies. Re-check tmux liveness on every tick.
@@ -433,6 +561,38 @@ export async function runDaemonTick(options: DaemonOptions): Promise<void> {
 					session.stalledSince = new Date().toISOString();
 					session.escalationLevel = 0;
 					store.updateEscalation(session.agentName, 0, session.stalledSince);
+
+					// First-stall mail nudge:
+					// If the agent has unread mail, nudge once before escalation
+					// progression so "waiting on inbox" sessions are prompted early.
+					const unreadMailCount = getUnreadMailCount(overstoryDir, session.agentName);
+					if (unreadMailCount > 0) {
+						let delivered = false;
+						try {
+							const nudgeResult = await nudge(
+								root,
+								session.agentName,
+								`[WATCHDOG] You have ${unreadMailCount} unread mail message${unreadMailCount === 1 ? "" : "s"}. Run: overstory mail check --agent ${session.agentName}`,
+								true, // force — skip debounce
+							);
+							delivered = nudgeResult.delivered;
+						} catch {
+							// Non-fatal: proceed with escalation workflow
+						}
+
+						recordEvent(eventStore, {
+							runId,
+							agentName: session.agentName,
+							eventType: "custom",
+							level: "warn",
+							data: {
+								type: "mail_nudge",
+								escalationLevel: 0,
+								unreadCount: unreadMailCount,
+								delivered,
+							},
+						});
+					}
 				}
 
 				// Check if enough time has passed to advance to the next escalation level

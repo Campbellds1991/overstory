@@ -4,21 +4,24 @@
  * Uses real filesystem (temp directories via mkdtemp) and real SessionStore
  * (bun:sqlite) for session persistence, plus real health evaluation logic.
  *
- * Only tmux operations (isSessionAlive, killSession), triage, and nudge are
+ * Only tmux operations (isSessionAlive, killSession), triage, nudge, and
+ * bead-status checks are
  * mocked via dependency injection (_tmux, _triage, _nudge params) because:
  * - Real tmux interferes with developer sessions and is fragile in CI.
  * - Real triage spawns Claude CLI which has cost and latency.
  * - Real nudge requires active tmux sessions.
+ * - Real bead checks shell out to bd.
  *
  * Does NOT use mock.module() — it leaks across test files. See mulch record
  * mx-56558b for background.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEventStore } from "../events/store.ts";
+import { createMailStore } from "../mail/store.ts";
 import { createSessionStore } from "../sessions/store.ts";
 import type { AgentSession, HealthCheck, StoredEvent } from "../types.ts";
 import { buildCompletionMessage, runDaemonTick } from "./daemon.ts";
@@ -150,6 +153,84 @@ function nudgeTracker(): {
 			return { delivered: true };
 		},
 		calls,
+	};
+}
+
+/** Seed one unread message for an agent in mail.db. */
+function seedUnreadMail(
+	root: string,
+	toAgent: string,
+	opts?: { from?: string; subject?: string; body?: string },
+): void {
+	const store = createMailStore(join(root, ".overstory", "mail.db"));
+	try {
+		store.insert({
+			id: "",
+			from: opts?.from ?? "orchestrator",
+			to: toAgent,
+			subject: opts?.subject ?? "Unread",
+			body: opts?.body ?? "Please check your inbox.",
+			type: "status",
+			priority: "normal",
+			threadId: null,
+			payload: null,
+		});
+	} finally {
+		store.close();
+	}
+}
+
+/** Create a fake bead status reader with per-bead status control. */
+function beadStatusTracker(statusMap: Record<string, string>): {
+	beads: { show: (id: string) => Promise<{ status: string }> };
+	calls: string[];
+} {
+	const calls: string[] = [];
+	return {
+		beads: {
+			show: async (id: string) => {
+				calls.push(id);
+				return { status: statusMap[id] ?? "open" };
+			},
+		},
+		calls,
+	};
+}
+
+/**
+ * Install a fake `bd` binary at the front of PATH that records invocations.
+ */
+async function installFakeBd(
+	root: string,
+	markerPath: string,
+	status: "open" | "closed" = "open",
+): Promise<{ restore: () => void }> {
+	const fakeBinDir = join(root, "fake-bin");
+	const fakeBdPath = join(fakeBinDir, "bd");
+	await mkdir(fakeBinDir, { recursive: true });
+	await writeFile(
+		fakeBdPath,
+		`#!/bin/sh
+echo "$@" >> "${markerPath}"
+if [ "$1" = "show" ]; then
+	printf '[{"id":"%s","title":"Fake","status":"${status}","priority":1,"issue_type":"task"}]\n' "$2"
+	exit 0
+fi
+printf '[]\n'
+`,
+		{ mode: 0o755 },
+	);
+
+	const originalPath = process.env.PATH;
+	process.env.PATH = `${fakeBinDir}${originalPath ? `:${originalPath}` : ""}`;
+	return {
+		restore: () => {
+			if (originalPath === undefined) {
+				delete process.env.PATH;
+			} else {
+				process.env.PATH = originalPath;
+			}
+		},
 	};
 }
 
@@ -288,6 +369,123 @@ describe("daemon tick", () => {
 		expect(reloaded[0]?.state).toBe("zombie");
 	});
 
+	test("does not poll bead status without authoritative bead workspace even when bd is on PATH", async () => {
+		const session = makeSession({
+			agentName: "no-beads-workspace-agent",
+			beadId: "bead-workspace-missing-1",
+			tmuxSession: "overstory-no-beads-workspace-agent",
+			state: "working",
+			lastActivity: new Date().toISOString(),
+		});
+		writeSessionsToStore(tempRoot, [session]);
+
+		const markerPath = join(tempRoot, "fake-bd-calls.log");
+		const fakeBd = await installFakeBd(tempRoot, markerPath, "open");
+		try {
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				_tmux: tmuxAllAlive(),
+				_triage: triageAlways("extend"),
+				_nudge: nudgeTracker().nudge,
+			});
+		} finally {
+			fakeBd.restore();
+		}
+
+		expect(await Bun.file(markerPath).exists()).toBe(false);
+		const reloaded = readSessionsFromStore(tempRoot);
+		expect(reloaded[0]?.state).toBe("working");
+	});
+
+	test("polls bead status when authoritative bead workspace is present and bd is on PATH", async () => {
+		const session = makeSession({
+			agentName: "with-beads-workspace-agent",
+			beadId: "bead-workspace-present-1",
+			tmuxSession: "overstory-with-beads-workspace-agent",
+			state: "working",
+			lastActivity: new Date().toISOString(),
+		});
+		writeSessionsToStore(tempRoot, [session]);
+		await mkdir(join(tempRoot, ".beads"), { recursive: true });
+
+		const markerPath = join(tempRoot, "fake-bd-calls.log");
+		const fakeBd = await installFakeBd(tempRoot, markerPath, "open");
+		try {
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				_tmux: tmuxAllAlive(),
+				_triage: triageAlways("extend"),
+				_nudge: nudgeTracker().nudge,
+			});
+		} finally {
+			fakeBd.restore();
+		}
+
+		expect(await Bun.file(markerPath).exists()).toBe(true);
+		const lines = (await Bun.file(markerPath).text())
+			.split("\n")
+			.map((line) => line.trim())
+			.filter((line) => line.length > 0);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain("show bead-workspace-present-1 --json");
+	});
+
+	test("auto-completes session when linked bead is closed", async () => {
+		const session = makeSession({
+			agentName: "closed-bead-agent",
+			beadId: "bead-closed-1",
+			tmuxSession: "overstory-closed-bead-agent",
+			state: "working",
+			lastActivity: new Date().toISOString(),
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+		const beadsMock = beadStatusTracker({ "bead-closed-1": "closed" });
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			_tmux: tmuxAllAlive(),
+			_triage: triageAlways("extend"),
+			_nudge: nudgeTracker().nudge,
+			_beads: beadsMock.beads,
+		});
+
+		expect(beadsMock.calls).toEqual(["bead-closed-1"]);
+		const reloaded = readSessionsFromStore(tempRoot);
+		expect(reloaded[0]?.state).toBe("completed");
+		expect(reloaded[0]?.escalationLevel).toBe(0);
+		expect(reloaded[0]?.stalledSince).toBeNull();
+	});
+
+	test("does not auto-complete session when linked bead is still open", async () => {
+		const session = makeSession({
+			agentName: "open-bead-agent",
+			beadId: "bead-open-1",
+			tmuxSession: "overstory-open-bead-agent",
+			state: "working",
+			lastActivity: new Date().toISOString(),
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+		const beadsMock = beadStatusTracker({ "bead-open-1": "open" });
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			_tmux: tmuxAllAlive(),
+			_triage: triageAlways("extend"),
+			_nudge: nudgeTracker().nudge,
+			_beads: beadsMock.beads,
+		});
+
+		expect(beadsMock.calls).toEqual(["bead-open-1"]);
+		const reloaded = readSessionsFromStore(tempRoot);
+		expect(reloaded[0]?.state).toBe("working");
+	});
+
 	// --- Test 4: progressive nudging for stalled agents ---
 
 	test("first tick with stalled agent sets stalledSince and stays at level 0 (warn)", async () => {
@@ -329,6 +527,160 @@ describe("daemon tick", () => {
 		expect(reloaded[0]?.state).toBe("stalled");
 		expect(reloaded[0]?.escalationLevel).toBe(0);
 		expect(reloaded[0]?.stalledSince).not.toBeNull();
+	});
+
+	test("first stalled tick nudges unread-mail agents before escalation progression", async () => {
+		const staleActivity = new Date(Date.now() - 60_000).toISOString();
+		const session = makeSession({
+			agentName: "mail-stalled-agent",
+			tmuxSession: "overstory-mail-stalled-agent",
+			state: "working",
+			lastActivity: staleActivity,
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+		seedUnreadMail(tempRoot, "mail-stalled-agent", {
+			subject: "Pending work",
+			body: "Please respond.",
+		});
+
+		const tmuxMock = tmuxWithLiveness({ "overstory-mail-stalled-agent": true });
+		const nudgeMock = nudgeTracker();
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			nudgeIntervalMs: 60_000,
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_nudge: nudgeMock.nudge,
+		});
+
+		expect(nudgeMock.calls).toHaveLength(1);
+		expect(nudgeMock.calls[0]?.agentName).toBe("mail-stalled-agent");
+		expect(nudgeMock.calls[0]?.message).toContain("unread mail");
+
+		const reloaded = readSessionsFromStore(tempRoot);
+		expect(reloaded[0]?.state).toBe("stalled");
+		expect(reloaded[0]?.escalationLevel).toBe(0);
+		expect(reloaded[0]?.stalledSince).not.toBeNull();
+	});
+
+	test("first stalled unread-mail nudge is one-shot and does not jump escalation", async () => {
+		const staleActivity = new Date(Date.now() - 60_000).toISOString();
+		const session = makeSession({
+			agentName: "mail-once-agent",
+			tmuxSession: "overstory-mail-once-agent",
+			state: "working",
+			lastActivity: staleActivity,
+		});
+
+		writeSessionsToStore(tempRoot, [session]);
+		seedUnreadMail(tempRoot, "mail-once-agent", {
+			subject: "Pending review",
+			body: "Please check inbox.",
+		});
+
+		const tmuxMock = tmuxWithLiveness({ "overstory-mail-once-agent": true });
+		const nudgeMock = nudgeTracker();
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			nudgeIntervalMs: 60_000,
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_nudge: nudgeMock.nudge,
+		});
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			nudgeIntervalMs: 60_000,
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_nudge: nudgeMock.nudge,
+		});
+
+		const unreadMailNudges = nudgeMock.calls.filter((c) => c.message.includes("unread mail"));
+		const escalationNudges = nudgeMock.calls.filter((c) => c.message.includes("appears stalled"));
+
+		expect(unreadMailNudges).toHaveLength(1);
+		expect(unreadMailNudges[0]?.agentName).toBe("mail-once-agent");
+		expect(escalationNudges).toHaveLength(0);
+
+		const reloaded = readSessionsFromStore(tempRoot);
+		expect(reloaded).toHaveLength(1);
+		expect(reloaded[0]?.state).toBe("stalled");
+		expect(reloaded[0]?.escalationLevel).toBe(0);
+		expect(reloaded[0]?.stalledSince).not.toBeNull();
+		expect(tmuxMock.killed).toHaveLength(0);
+	});
+
+	test("pending unread mail does not alter escalation boundaries after first stall", async () => {
+		const staleActivity = new Date(Date.now() - 60_000).toISOString();
+		const stalledSince = new Date(Date.now() - 70_000).toISOString();
+		const sessions: AgentSession[] = [
+			makeSession({
+				id: "pending-mail-session",
+				agentName: "pending-mail-agent",
+				tmuxSession: "overstory-pending-mail-agent",
+				state: "stalled",
+				lastActivity: staleActivity,
+				escalationLevel: 0,
+				stalledSince,
+			}),
+			makeSession({
+				id: "no-mail-session",
+				agentName: "no-mail-agent",
+				tmuxSession: "overstory-no-mail-agent",
+				state: "stalled",
+				lastActivity: staleActivity,
+				escalationLevel: 0,
+				stalledSince,
+			}),
+		];
+
+		writeSessionsToStore(tempRoot, sessions);
+		seedUnreadMail(tempRoot, "pending-mail-agent", {
+			subject: "Unread task",
+			body: "Follow up required.",
+		});
+
+		const tmuxMock = tmuxWithLiveness({
+			"overstory-pending-mail-agent": true,
+			"overstory-no-mail-agent": true,
+		});
+		const nudgeMock = nudgeTracker();
+
+		await runDaemonTick({
+			root: tempRoot,
+			...THRESHOLDS,
+			nudgeIntervalMs: 60_000,
+			_tmux: tmuxMock,
+			_triage: triageAlways("extend"),
+			_nudge: nudgeMock.nudge,
+		});
+
+		const reloaded = readSessionsFromStore(tempRoot);
+		const pending = reloaded.find((s) => s.agentName === "pending-mail-agent");
+		const noMail = reloaded.find((s) => s.agentName === "no-mail-agent");
+
+		expect(pending).toBeDefined();
+		expect(noMail).toBeDefined();
+		expect(pending?.state).toBe("stalled");
+		expect(noMail?.state).toBe("stalled");
+		expect(pending?.escalationLevel).toBe(1);
+		expect(noMail?.escalationLevel).toBe(1);
+
+		expect(nudgeMock.calls).toHaveLength(2);
+		const nudgedAgents = nudgeMock.calls.map((c) => c.agentName).sort();
+		expect(nudgedAgents).toEqual(["no-mail-agent", "pending-mail-agent"]);
+		for (const call of nudgeMock.calls) {
+			expect(call.message).toContain("appears stalled");
+			expect(call.message).not.toContain("unread mail");
+		}
+		expect(tmuxMock.killed).toHaveLength(0);
 	});
 
 	test("stalled agent at level 1 sends nudge", async () => {
