@@ -16,12 +16,19 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { deployHooks } from "../agents/hooks-deployer.ts";
 import { createIdentity, loadIdentity } from "../agents/identity.ts";
-import { createManifestLoader, resolveModel } from "../agents/manifest.ts";
+import { createManifestLoader } from "../agents/manifest.ts";
 import { createBeadsClient } from "../beads/client.ts";
 import { loadConfig } from "../config.ts";
 import { AgentError, ValidationError } from "../errors.ts";
+import { createProviderRegistry } from "../providers/registry.ts";
 import { openSessionStore } from "../sessions/compat.ts";
-import type { AgentSession } from "../types.ts";
+import type {
+	AgentManifest,
+	AgentSession,
+	OverstoryConfig,
+	ProviderLaunchSpec,
+	ProviderRegistry,
+} from "../types.ts";
 import {
 	createSession,
 	isSessionAlive,
@@ -30,6 +37,11 @@ import {
 	waitForTuiReady,
 } from "../worktree/tmux.ts";
 import { isRunningAsRoot } from "./sling.ts";
+
+/** Dependency injection for provider wiring in tests. */
+export interface SupervisorDeps {
+	_providers?: ProviderRegistry;
+}
 
 /**
  * Build the supervisor startup beacon.
@@ -106,6 +118,23 @@ function parseFlags(args: string[]): {
 	return flags;
 }
 
+/** Resolve supervisor launch command/env/startup from provider registry. */
+export function resolveSupervisorLaunch(
+	registry: ProviderRegistry,
+	config: OverstoryConfig,
+	manifest: AgentManifest,
+	appendSystemPrompt?: string,
+): ProviderLaunchSpec {
+	return registry.buildLaunch({
+		config,
+		manifest,
+		role: "supervisor",
+		fallback: "opus",
+		startupProfile: "persistent",
+		appendSystemPrompt,
+	});
+}
+
 /**
  * Start a supervisor agent.
  *
@@ -119,7 +148,7 @@ function parseFlags(args: string[]): {
  * 8. Send startup beacon
  * 9. Record session in SessionStore (sessions.db)
  */
-async function startSupervisor(args: string[]): Promise<void> {
+async function startSupervisor(args: string[], deps: SupervisorDeps = {}): Promise<void> {
 	const flags = parseFlags(args);
 
 	if (!flags.task) {
@@ -143,6 +172,7 @@ async function startSupervisor(args: string[]): Promise<void> {
 
 	const cwd = process.cwd();
 	const config = await loadConfig(cwd);
+	const providers = deps._providers ?? createProviderRegistry();
 	const projectRoot = config.project.root;
 
 	// Validate bead exists and is workable (open or in_progress)
@@ -202,27 +232,29 @@ async function startSupervisor(args: string[]): Promise<void> {
 			join(projectRoot, config.agents.baseDir),
 		);
 		const manifest = await manifestLoader.load();
-		const { model, env } = resolveModel(config, manifest, "supervisor", "opus");
 
 		// Spawn tmux session at project root with Claude Code (interactive mode).
 		// Inject the supervisor base definition via --append-system-prompt.
 		const tmuxSession = `overstory-${config.project.name}-supervisor-${flags.name}`;
 		const agentDefPath = join(projectRoot, ".overstory", "agent-defs", "supervisor.md");
 		const agentDefFile = Bun.file(agentDefPath);
-		let claudeCmd = `claude --model ${model} --dangerously-skip-permissions`;
+		let appendSystemPrompt: string | undefined;
 		if (await agentDefFile.exists()) {
-			const agentDef = await agentDefFile.text();
-			const escaped = agentDef.replace(/'/g, "'\\''");
-			claudeCmd += ` --append-system-prompt '${escaped}'`;
+			appendSystemPrompt = await agentDefFile.text();
 		}
-		const pid = await createSession(tmuxSession, projectRoot, claudeCmd, {
-			...env,
+		const launch = resolveSupervisorLaunch(providers, config, manifest, appendSystemPrompt);
+		const pid = await createSession(tmuxSession, projectRoot, launch.command, {
+			...launch.env,
 			OVERSTORY_AGENT_NAME: flags.name,
 		});
 
 		// Wait for Claude Code TUI to render before sending input
-		await waitForTuiReady(tmuxSession);
-		await Bun.sleep(1_000);
+		if (launch.startup.waitForTuiReady) {
+			await waitForTuiReady(tmuxSession);
+		}
+		if (launch.startup.initialDelayMs > 0) {
+			await Bun.sleep(launch.startup.initialDelayMs);
+		}
 
 		const beacon = buildSupervisorBeacon({
 			name: flags.name,
@@ -233,7 +265,7 @@ async function startSupervisor(args: string[]): Promise<void> {
 		await sendKeys(tmuxSession, beacon);
 
 		// Follow-up Enters with increasing delays to ensure submission
-		for (const delay of [1_000, 2_000]) {
+		for (const delay of launch.startup.followupEnterDelaysMs) {
 			await Bun.sleep(delay);
 			await sendKeys(tmuxSession, "");
 		}
@@ -503,7 +535,10 @@ via overstory sling and coordinate their work.`;
 /**
  * Entry point for `overstory supervisor <subcommand>`.
  */
-export async function supervisorCommand(args: string[]): Promise<void> {
+export async function supervisorCommand(
+	args: string[],
+	deps: SupervisorDeps = {},
+): Promise<void> {
 	if (args.includes("--help") || args.includes("-h") || args.length === 0) {
 		process.stdout.write(`${SUPERVISOR_HELP}\n`);
 		return;
@@ -514,7 +549,7 @@ export async function supervisorCommand(args: string[]): Promise<void> {
 
 	switch (subcommand) {
 		case "start":
-			await startSupervisor(subArgs);
+			await startSupervisor(subArgs, deps);
 			break;
 		case "stop":
 			await stopSupervisor(subArgs);

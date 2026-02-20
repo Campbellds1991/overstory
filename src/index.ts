@@ -39,6 +39,7 @@ import { watchCommand } from "./commands/watch.ts";
 import { worktreeCommand } from "./commands/worktree.ts";
 import { OverstoryError, WorktreeError } from "./errors.ts";
 import { setQuiet } from "./logging/color.ts";
+import { createProviderRegistry } from "./providers/registry.ts";
 
 const VERSION = "0.5.8";
 
@@ -152,6 +153,7 @@ function suggestCommand(input: string): string | undefined {
 
 async function main(): Promise<void> {
 	const args = process.argv.slice(2);
+	const providerRegistry = createProviderRegistry();
 
 	// Parse global flags before command routing
 	const quietIndex = args.indexOf("--quiet");
@@ -192,7 +194,7 @@ async function main(): Promise<void> {
 			await initCommand(commandArgs);
 			break;
 		case "sling":
-			await slingCommand(commandArgs);
+			await slingCommand(commandArgs, { _providers: providerRegistry });
 			break;
 		case "spec":
 			await specCommand(commandArgs);
@@ -220,16 +222,16 @@ async function main(): Promise<void> {
 			break;
 		}
 		case "coordinator":
-			await coordinatorCommand(commandArgs);
+			await coordinatorCommand(commandArgs, { _providers: providerRegistry });
 			break;
 		case "supervisor":
-			await supervisorCommand(commandArgs);
+			await supervisorCommand(commandArgs, { _providers: providerRegistry });
 			break;
 		case "hooks":
 			await hooksCommand(commandArgs);
 			break;
 		case "monitor":
-			await monitorCommand(commandArgs);
+			await monitorCommand(commandArgs, { _providers: providerRegistry });
 			break;
 		case "mail":
 			await mailCommand(commandArgs);

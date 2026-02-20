@@ -1973,3 +1973,141 @@ describe("buildCompletionMessage", () => {
 		expect(msg).toContain("3");
 	});
 });
+
+describe("orchestration execution parity regression matrix", () => {
+	const runId = "run-regression-matrix-17";
+
+	test("coordinator/sling/supervisor/monitor paths preserve run-completion behavior", async () => {
+		type MatrixCase = {
+			path: "coordinator" | "sling" | "supervisor" | "monitor";
+			sessions: AgentSession[];
+			expectCoordinatorNudge: boolean;
+			expectedMessageFragments: string[];
+		};
+
+		const matrix: MatrixCase[] = [
+			{
+				path: "sling",
+				sessions: [
+					makeSession({
+						id: "matrix-sling-builder",
+						agentName: "builder-matrix",
+						capability: "builder",
+						tmuxSession: "overstory-matrix-builder",
+						state: "completed",
+						runId,
+						lastActivity: new Date().toISOString(),
+					}),
+					makeSession({
+						id: "matrix-sling-coordinator",
+						agentName: "coordinator",
+						capability: "coordinator",
+						tmuxSession: "overstory-matrix-coordinator",
+						state: "working",
+						runId,
+						lastActivity: new Date().toISOString(),
+					}),
+				],
+				expectCoordinatorNudge: true,
+				expectedMessageFragments: ["builder", "merge/cleanup"],
+			},
+			{
+				path: "supervisor",
+				sessions: [
+					makeSession({
+						id: "matrix-supervisor-worker",
+						agentName: "supervisor-matrix",
+						capability: "supervisor",
+						tmuxSession: "overstory-matrix-supervisor",
+						state: "completed",
+						runId,
+						lastActivity: new Date().toISOString(),
+					}),
+					makeSession({
+						id: "matrix-supervisor-coordinator",
+						agentName: "coordinator",
+						capability: "coordinator",
+						tmuxSession: "overstory-matrix-coordinator",
+						state: "working",
+						runId,
+						lastActivity: new Date().toISOString(),
+					}),
+				],
+				expectCoordinatorNudge: true,
+				expectedMessageFragments: ["(supervisor)", "next steps"],
+			},
+			{
+				path: "coordinator",
+				sessions: [
+					makeSession({
+						id: "matrix-coordinator-persistent",
+						agentName: "coordinator",
+						capability: "coordinator",
+						tmuxSession: "overstory-matrix-coordinator",
+						state: "working",
+						runId,
+						lastActivity: new Date().toISOString(),
+					}),
+				],
+				expectCoordinatorNudge: false,
+				expectedMessageFragments: [],
+			},
+			{
+				path: "monitor",
+				sessions: [
+					makeSession({
+						id: "matrix-monitor-persistent",
+						agentName: "monitor",
+						capability: "monitor",
+						tmuxSession: "overstory-matrix-monitor",
+						state: "completed",
+						runId,
+						lastActivity: new Date().toISOString(),
+					}),
+					makeSession({
+						id: "matrix-monitor-coordinator",
+						agentName: "coordinator",
+						capability: "coordinator",
+						tmuxSession: "overstory-matrix-coordinator",
+						state: "working",
+						runId,
+						lastActivity: new Date().toISOString(),
+					}),
+				],
+				expectCoordinatorNudge: false,
+				expectedMessageFragments: [],
+			},
+		];
+
+		for (const matrixCase of matrix) {
+			await rm(join(tempRoot, ".overstory", "sessions.db"), { force: true });
+			await rm(join(tempRoot, ".overstory", "run-complete-notified.txt"), { force: true });
+			writeSessionsToStore(tempRoot, matrixCase.sessions);
+			await Bun.write(join(tempRoot, ".overstory", "current-run.txt"), runId);
+
+			const nudgeMock = nudgeTracker();
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				_tmux: tmuxAllAlive(),
+				_triage: triageAlways("extend"),
+				_nudge: nudgeMock.nudge,
+				_eventStore: null,
+			});
+
+			const coordinatorNudges = nudgeMock.calls.filter(
+				(call) => call.agentName === "coordinator" && call.message.includes("WATCHDOG"),
+			);
+			expect(coordinatorNudges.length > 0).toBe(matrixCase.expectCoordinatorNudge);
+
+			if (matrixCase.expectCoordinatorNudge) {
+				expect(coordinatorNudges).toHaveLength(1);
+				for (const fragment of matrixCase.expectedMessageFragments) {
+					expect(coordinatorNudges[0]?.message).toContain(fragment);
+				}
+			} else {
+				expect(coordinatorNudges).toHaveLength(0);
+			}
+		}
+	});
+});

@@ -12,6 +12,8 @@
 import { Database } from "bun:sqlite";
 import { mkdir, readdir } from "node:fs/promises";
 import { basename, join } from "node:path";
+import { normalizeHookConfig } from "../agents/hooks-deployer.ts";
+import type { HookConfig } from "../agents/hooks-policy.ts";
 import { DEFAULT_CONFIG } from "../config.ts";
 import { ValidationError } from "../errors.ts";
 import type { AgentManifest, OverstoryConfig } from "../types.ts";
@@ -268,13 +270,7 @@ function buildAgentManifest(): AgentManifest {
  * to match Biome formatting rules.
  */
 function buildHooksJson(): string {
-	// Tool name extraction: reads hook stdin JSON and extracts tool_name field.
-	// Claude Code sends {"tool_name":"Bash","tool_input":{...}} on stdin for
-	// PreToolUse/PostToolUse hooks.
-	const toolNameExtract =
-		'read -r INPUT; TOOL_NAME=$(echo "$INPUT" | sed \'s/.*"tool_name": *"\\([^"]*\\)".*/\\1/\');';
-
-	const hooks = {
+	const hooks: HookConfig = {
 		hooks: {
 			SessionStart: [
 				{
@@ -314,7 +310,7 @@ function buildHooksJson(): string {
 					hooks: [
 						{
 							type: "command",
-							command: `${toolNameExtract} overstory log tool-start --agent orchestrator --tool-name "$TOOL_NAME"`,
+							command: "overstory log tool-start --agent orchestrator --stdin",
 						},
 					],
 				},
@@ -325,7 +321,7 @@ function buildHooksJson(): string {
 					hooks: [
 						{
 							type: "command",
-							command: `${toolNameExtract} overstory log tool-end --agent orchestrator --tool-name "$TOOL_NAME"`,
+							command: "overstory log tool-end --agent orchestrator --stdin",
 						},
 					],
 				},
@@ -336,7 +332,7 @@ function buildHooksJson(): string {
 					hooks: [
 						{
 							type: "command",
-							command: "overstory log session-end --agent orchestrator",
+							command: "overstory log session-end --agent orchestrator --stdin",
 						},
 						{
 							type: "command",
@@ -359,7 +355,14 @@ function buildHooksJson(): string {
 		},
 	};
 
-	return `${JSON.stringify(hooks, null, "\t")}\n`;
+	const normalizedHooks = normalizeHookConfig(hooks, {
+		agentName: "orchestrator",
+		capability: "coordinator",
+		providerKind: "native",
+		target: "orchestrator",
+	});
+
+	return `${JSON.stringify(normalizedHooks, null, "\t")}\n`;
 }
 
 /**

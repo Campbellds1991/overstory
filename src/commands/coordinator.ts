@@ -16,12 +16,19 @@ import { mkdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { deployHooks } from "../agents/hooks-deployer.ts";
 import { createIdentity, loadIdentity } from "../agents/identity.ts";
-import { createManifestLoader, resolveModel } from "../agents/manifest.ts";
+import { createManifestLoader } from "../agents/manifest.ts";
 import { loadConfig } from "../config.ts";
 import { AgentError, ValidationError } from "../errors.ts";
+import { createProviderRegistry } from "../providers/registry.ts";
 import { openSessionStore } from "../sessions/compat.ts";
 import { createRunStore } from "../sessions/store.ts";
-import type { AgentSession } from "../types.ts";
+import type {
+	AgentManifest,
+	AgentSession,
+	OverstoryConfig,
+	ProviderLaunchSpec,
+	ProviderRegistry,
+} from "../types.ts";
 import { isProcessRunning } from "../watchdog/health.ts";
 import {
 	createSession,
@@ -71,6 +78,7 @@ export interface CoordinatorDeps {
 		stop: () => Promise<boolean>;
 		isRunning: () => Promise<boolean>;
 	};
+	_providers?: ProviderRegistry;
 }
 
 /**
@@ -249,6 +257,23 @@ export function buildCoordinatorBeacon(): string {
 	return parts.join(" — ");
 }
 
+/** Resolve coordinator launch command/env/startup from provider registry. */
+export function resolveCoordinatorLaunch(
+	registry: ProviderRegistry,
+	config: OverstoryConfig,
+	manifest: AgentManifest,
+	appendSystemPrompt?: string,
+): ProviderLaunchSpec {
+	return registry.buildLaunch({
+		config,
+		manifest,
+		role: "coordinator",
+		fallback: "opus",
+		startupProfile: "persistent",
+		appendSystemPrompt,
+	});
+}
+
 /**
  * Start the coordinator agent.
  *
@@ -293,6 +318,7 @@ async function startCoordinator(args: string[], deps: CoordinatorDeps = {}): Pro
 	const cwd = process.cwd();
 	const config = await loadConfig(cwd);
 	const projectRoot = config.project.root;
+	const providers = deps._providers ?? createProviderRegistry();
 	const watchdog = deps._watchdog ?? createDefaultWatchdog(projectRoot);
 	const monitor = deps._monitor ?? createDefaultMonitor(projectRoot);
 	const tmuxSession = coordinatorTmuxSession(config.project.name);
@@ -349,7 +375,6 @@ async function startCoordinator(args: string[], deps: CoordinatorDeps = {}): Pro
 			join(projectRoot, config.agents.baseDir),
 		);
 		const manifest = await manifestLoader.load();
-		const { model, env } = resolveModel(config, manifest, "coordinator", "opus");
 
 		// Spawn tmux session at project root with Claude Code (interactive mode).
 		// Inject the coordinator base definition via --append-system-prompt so the
@@ -357,15 +382,13 @@ async function startCoordinator(args: string[], deps: CoordinatorDeps = {}): Pro
 		// (overstory-gaio, overstory-0kwf).
 		const agentDefPath = join(projectRoot, ".overstory", "agent-defs", "coordinator.md");
 		const agentDefFile = Bun.file(agentDefPath);
-		let claudeCmd = `claude --model ${model} --dangerously-skip-permissions`;
+		let appendSystemPrompt: string | undefined;
 		if (await agentDefFile.exists()) {
-			const agentDef = await agentDefFile.text();
-			// Single-quote the content for safe shell expansion (only escape single quotes)
-			const escaped = agentDef.replace(/'/g, "'\\''");
-			claudeCmd += ` --append-system-prompt '${escaped}'`;
+			appendSystemPrompt = await agentDefFile.text();
 		}
-		const pid = await tmux.createSession(tmuxSession, projectRoot, claudeCmd, {
-			...env,
+		const launch = resolveCoordinatorLaunch(providers, config, manifest, appendSystemPrompt);
+		const pid = await tmux.createSession(tmuxSession, projectRoot, launch.command, {
+			...launch.env,
 			OVERSTORY_AGENT_NAME: COORDINATOR_NAME,
 		});
 
@@ -395,14 +418,18 @@ async function startCoordinator(args: string[], deps: CoordinatorDeps = {}): Pro
 		store.upsert(session);
 
 		// Wait for Claude Code TUI to render before sending input
-		await tmux.waitForTuiReady(tmuxSession);
-		await Bun.sleep(1_000);
+		if (launch.startup.waitForTuiReady) {
+			await tmux.waitForTuiReady(tmuxSession);
+		}
+		if (launch.startup.initialDelayMs > 0) {
+			await Bun.sleep(launch.startup.initialDelayMs);
+		}
 
 		const beacon = buildCoordinatorBeacon();
 		await tmux.sendKeys(tmuxSession, beacon);
 
 		// Follow-up Enters with increasing delays to ensure submission
-		for (const delay of [1_000, 2_000]) {
+		for (const delay of launch.startup.followupEnterDelaysMs) {
 			await Bun.sleep(delay);
 			await tmux.sendKeys(tmuxSession, "");
 		}

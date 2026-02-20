@@ -1,6 +1,16 @@
 import { mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { AgentError } from "../errors.ts";
+import {
+	resolveHookAdapter,
+	type HookAdapter,
+	type HookConfig,
+	type HookEntry,
+	type HookPolicy,
+	type HookPolicyContext,
+	type HookProviderKind,
+	type HookTarget,
+} from "./hooks-policy.ts";
 
 /**
  * Capabilities that must never modify project files.
@@ -113,12 +123,6 @@ const SAFE_BASH_PREFIXES = [
 	"bun run typecheck",
 	"bun run biome",
 ];
-
-/** Hook entry shape matching Claude Code's settings.local.json format. */
-interface HookEntry {
-	matcher: string;
-	hooks: Array<{ type: string; command: string }>;
-}
 
 /**
  * Resolve the path to the hooks template file.
@@ -473,6 +477,53 @@ export function getCapabilityGuards(capability: string): HookEntry[] {
 	return guards;
 }
 
+class DefaultHookPolicy implements HookPolicy {
+	readonly name = "default-hook-policy";
+
+	apply(config: HookConfig, context: HookPolicyContext): HookConfig {
+		const next = structuredClone(config);
+
+		const pathGuards = getPathBoundaryGuards();
+		const dangerGuards = getDangerGuards(context.agentName);
+		const capabilityGuards = getCapabilityGuards(context.capability);
+		const allGuards = [...pathGuards, ...dangerGuards, ...capabilityGuards];
+
+		if (allGuards.length > 0) {
+			const preToolUse = Array.isArray(next.hooks.PreToolUse) ? next.hooks.PreToolUse : [];
+			next.hooks.PreToolUse = [...allGuards, ...preToolUse];
+		}
+
+		return next;
+	}
+}
+
+const DEFAULT_HOOK_POLICY = new DefaultHookPolicy();
+
+export interface DeployHooksOptions {
+	providerKind?: HookProviderKind;
+	target?: HookTarget;
+	adapter?: HookAdapter;
+	policy?: HookPolicy;
+}
+
+export function normalizeHookConfig(
+	config: HookConfig,
+	context: HookPolicyContext,
+	adapter: HookAdapter = resolveHookAdapter(context.providerKind),
+): HookConfig {
+	return adapter.normalize(config, context);
+}
+
+export function applyHookPolicy(
+	config: HookConfig,
+	context: HookPolicyContext,
+	policy: HookPolicy = DEFAULT_HOOK_POLICY,
+	adapter: HookAdapter = resolveHookAdapter(context.providerKind),
+): HookConfig {
+	const normalized = adapter.normalize(config, context);
+	return policy.apply(normalized, context);
+}
+
 /**
  * Deploy hooks config to an agent's worktree as `.claude/settings.local.json`.
  *
@@ -482,13 +533,26 @@ export function getCapabilityGuards(capability: string): HookEntry[] {
  * @param worktreePath - Absolute path to the agent's git worktree
  * @param agentName - The unique name of the agent
  * @param capability - Agent capability (builder, scout, reviewer, lead, merger)
+ * @param options - Optional provider/policy overrides for hook deployment
  * @throws {AgentError} If the template is not found or the write fails
  */
 export async function deployHooks(
 	worktreePath: string,
 	agentName: string,
 	capability = "builder",
+	options: DeployHooksOptions = {},
 ): Promise<void> {
+	const providerKind = options.providerKind ?? "native";
+	const target = options.target ?? "agent";
+	const context: HookPolicyContext = {
+		agentName,
+		capability,
+		providerKind,
+		target,
+	};
+	const adapter = options.adapter ?? resolveHookAdapter(providerKind);
+	const policy = options.policy ?? DEFAULT_HOOK_POLICY;
+
 	const templatePath = getTemplatePath();
 	const file = Bun.file(templatePath);
 	const exists = await file.exists();
@@ -515,19 +579,11 @@ export async function deployHooks(
 		content = content.replace("{{AGENT_NAME}}", agentName);
 	}
 
-	// Parse the base config and merge guards into PreToolUse
-	const config = JSON.parse(content) as { hooks: Record<string, HookEntry[]> };
-	const pathGuards = getPathBoundaryGuards();
-	const dangerGuards = getDangerGuards(agentName);
-	const capabilityGuards = getCapabilityGuards(capability);
-	const allGuards = [...pathGuards, ...dangerGuards, ...capabilityGuards];
-
-	if (allGuards.length > 0) {
-		const preToolUse = config.hooks.PreToolUse ?? [];
-		config.hooks.PreToolUse = [...allGuards, ...preToolUse];
-	}
-
-	const finalContent = `${JSON.stringify(config, null, "\t")}\n`;
+	// Provider adapter normalizes hook parity; policy injects capability guards.
+	const config = JSON.parse(content) as HookConfig;
+	const normalized = adapter.normalize(config, context);
+	const finalConfig = policy.apply(normalized, context);
+	const finalContent = `${JSON.stringify(finalConfig, null, "\t")}\n`;
 
 	const claudeDir = join(worktreePath, ".claude");
 	const outputPath = join(claudeDir, "settings.local.json");
