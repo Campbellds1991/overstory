@@ -149,6 +149,16 @@ Prefix with `fix:`, `feat:`, or `docs:` when the category is clear. Plain descri
 - **Passing CI.** All PRs must pass CI checks (lint + typecheck + test) before merge.
 - **Description.** Briefly explain what the PR does and why. Link to any relevant issues.
 
+## Contributor Checklist & Acceptance Criteria
+
+Use the checklist and template in [docs/contributor-checklist.md](docs/contributor-checklist.md)
+when preparing PRs. It captures expected PR slicing and a reusable acceptance-criteria format.
+
+For architecture and migration context while reviewing PR scope:
+
+- [docs/architecture.md](docs/architecture.md)
+- [docs/migration-guide.md](docs/migration-guide.md)
+
 ## Reporting Issues
 
 Use [GitHub Issues](https://github.com/jayminwest/overstory/issues) for bug reports and feature requests. For security vulnerabilities, see [SECURITY.md](SECURITY.md).
