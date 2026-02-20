@@ -1826,3 +1826,130 @@ describe("provider hook parity regression matrix", () => {
 		}
 	});
 });
+
+describe("hook parity regression matrix (provider/runtime x capability tiers)", () => {
+	let tempDir: string;
+
+	type ParsedHookEntry = {
+		matcher: string;
+		hooks: Array<{ type: string; command: string }>;
+	};
+
+	type RuntimeTarget = "agent" | "orchestrator";
+
+	const providerKinds: HookProviderKind[] = ["native", "gateway"];
+	const runtimeTargets: RuntimeTarget[] = ["agent", "orchestrator"];
+	const implementationCapabilities = ["builder", "merger"];
+	const readOnlyCapabilities = ["scout", "reviewer", "lead"];
+	const coordinationCapabilities = ["coordinator", "supervisor", "monitor"];
+	const allCapabilities = [
+		...implementationCapabilities,
+		...readOnlyCapabilities,
+		...coordinationCapabilities,
+	];
+
+	const implementationSet = new Set(implementationCapabilities);
+	const readOnlySet = new Set(readOnlyCapabilities);
+	const coordinationSet = new Set(coordinationCapabilities);
+
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), "overstory-hook-matrix-"));
+	});
+
+	afterEach(async () => {
+		await rm(tempDir, { recursive: true, force: true });
+	});
+
+	async function loadPreToolUse(
+		providerKind: HookProviderKind,
+		target: RuntimeTarget,
+		capability: string,
+	): Promise<ParsedHookEntry[]> {
+		const worktreePath = join(tempDir, `${capability}-${providerKind}-${target}`);
+		const agentName = `${capability}-matrix-agent`;
+		await deployHooks(worktreePath, agentName, capability, { providerKind, target });
+		const content = await Bun.file(join(worktreePath, ".claude", "settings.local.json")).text();
+		const parsed = JSON.parse(content) as { hooks: Record<string, ParsedHookEntry[]> };
+		return parsed.hooks.PreToolUse ?? [];
+	}
+
+	test("provider parity holds for every runtime target + capability combination", async () => {
+		for (const target of runtimeTargets) {
+			for (const capability of allCapabilities) {
+				let baseline: ParsedHookEntry[] | null = null;
+				for (const providerKind of providerKinds) {
+					const preToolUse = await loadPreToolUse(providerKind, target, capability);
+					if (baseline === null) {
+						baseline = preToolUse;
+					} else {
+						expect(preToolUse).toEqual(baseline);
+					}
+				}
+			}
+		}
+	});
+
+	test("capability tier guard invariants hold across provider/runtime matrix", async () => {
+		for (const providerKind of providerKinds) {
+			for (const target of runtimeTargets) {
+				for (const capability of allCapabilities) {
+					const preToolUse = await loadPreToolUse(providerKind, target, capability);
+
+					for (const matcher of ["Write", "Edit", "NotebookEdit"]) {
+						const hasPathBoundary = preToolUse.some(
+							(entry) =>
+								entry.matcher === matcher &&
+								entry.hooks.some((hook) => hook.command.includes("OVERSTORY_WORKTREE_PATH")),
+						);
+						expect(hasPathBoundary).toBe(true);
+					}
+
+					const hasTaskBlock = preToolUse.some((entry) => entry.matcher === "Task");
+					expect(hasTaskBlock).toBe(true);
+
+					const hasBashPathBoundary = preToolUse.some(
+						(entry) =>
+							entry.matcher === "Bash" &&
+							entry.hooks.some((hook) => hook.command.includes("Bash path boundary violation")),
+					);
+
+					const bashFileGuard = preToolUse.find(
+						(entry) =>
+							entry.matcher === "Bash" &&
+							entry.hooks.some((hook) => hook.command.includes("cannot modify files")),
+					);
+					const bashFileGuardCommand = bashFileGuard?.hooks.find((hook) =>
+						hook.command.includes("cannot modify files"),
+					)?.command;
+
+					if (implementationSet.has(capability)) {
+						expect(hasBashPathBoundary).toBe(true);
+						expect(bashFileGuard).toBeUndefined();
+					} else {
+						expect(hasBashPathBoundary).toBe(false);
+						expect(bashFileGuard).toBeDefined();
+
+						for (const matcher of ["Write", "Edit", "NotebookEdit"]) {
+							const hasCapabilityBlock = preToolUse.some(
+								(entry) =>
+									entry.matcher === matcher &&
+									entry.hooks.some((hook) => hook.command.includes("cannot modify files")),
+							);
+							expect(hasCapabilityBlock).toBe(true);
+						}
+					}
+
+					if (coordinationSet.has(capability)) {
+						expect(bashFileGuardCommand).toContain("'^\\s*git add'");
+						expect(bashFileGuardCommand).toContain("'^\\s*git commit'");
+					}
+
+					if (readOnlySet.has(capability)) {
+						expect(bashFileGuardCommand).not.toContain("'^\\s*git add'");
+						expect(bashFileGuardCommand).not.toContain("'^\\s*git commit'");
+					}
+				}
+			}
+		}
+	});
+});

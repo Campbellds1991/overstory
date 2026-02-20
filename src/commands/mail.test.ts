@@ -1268,3 +1268,146 @@ describe("mailCommand", () => {
 		});
 	});
 });
+
+describe("orchestration execution parity regression matrix", () => {
+	let tempDir: string;
+	let origCwd: string;
+	let origWrite: typeof process.stdout.write;
+	let origStderrWrite: typeof process.stderr.write;
+	let output: string;
+	let stderrOutput: string;
+
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), "overstory-mail-regression-matrix-"));
+		await mkdir(join(tempDir, ".overstory"), { recursive: true });
+
+		origCwd = process.cwd();
+		process.chdir(tempDir);
+
+		output = "";
+		origWrite = process.stdout.write;
+		process.stdout.write = ((chunk: string) => {
+			output += chunk;
+			return true;
+		}) as typeof process.stdout.write;
+
+		stderrOutput = "";
+		origStderrWrite = process.stderr.write;
+		process.stderr.write = ((chunk: string) => {
+			stderrOutput += chunk;
+			return true;
+		}) as typeof process.stderr.write;
+	});
+
+	afterEach(async () => {
+		process.stdout.write = origWrite;
+		process.stderr.write = origStderrWrite;
+		process.chdir(origCwd);
+		await rm(tempDir, { recursive: true, force: true });
+	});
+
+	test("coordinator/sling/supervisor/monitor send flows keep mail+nudge parity", async () => {
+		type MatrixCase = {
+			path: "coordinator" | "sling" | "supervisor" | "monitor";
+			from: string;
+			to: string;
+			type: string;
+			priority?: "low" | "normal" | "high" | "urgent";
+			expectsNudge: boolean;
+			expectedReason?: string;
+		};
+
+		const matrix: MatrixCase[] = [
+			{
+				path: "coordinator",
+				from: "coordinator",
+				to: "builder-1",
+				type: "dispatch",
+				priority: "normal",
+				expectsNudge: false,
+			},
+			{
+				path: "sling",
+				from: "builder-1",
+				to: "coordinator",
+				type: "worker_done",
+				priority: "normal",
+				expectsNudge: true,
+				expectedReason: "worker_done",
+			},
+			{
+				path: "supervisor",
+				from: "supervisor-1",
+				to: "coordinator",
+				type: "merge_ready",
+				priority: "normal",
+				expectsNudge: true,
+				expectedReason: "merge_ready",
+			},
+			{
+				path: "monitor",
+				from: "monitor",
+				to: "coordinator",
+				type: "health_check",
+				priority: "high",
+				expectsNudge: true,
+				expectedReason: "high priority",
+			},
+		];
+
+		for (const matrixCase of matrix) {
+			const subject = `matrix-${matrixCase.path}-subject`;
+			const body = `matrix-${matrixCase.path}-body`;
+			const sendArgs = [
+				"send",
+				"--from",
+				matrixCase.from,
+				"--to",
+				matrixCase.to,
+				"--subject",
+				subject,
+				"--body",
+				body,
+				"--type",
+				matrixCase.type,
+				"--priority",
+				matrixCase.priority ?? "normal",
+			];
+
+			output = "";
+			stderrOutput = "";
+			await mailCommand(sendArgs);
+
+			const markerPath = join(tempDir, ".overstory", "pending-nudges", `${matrixCase.to}.json`);
+			const markerFile = Bun.file(markerPath);
+			const markerExists = await markerFile.exists();
+			expect(markerExists).toBe(matrixCase.expectsNudge);
+
+			if (matrixCase.expectsNudge) {
+				const marker = JSON.parse(await markerFile.text()) as {
+					from: string;
+					reason: string;
+					subject: string;
+				};
+				expect(marker.from).toBe(matrixCase.from);
+				expect(marker.reason).toBe(matrixCase.expectedReason);
+				expect(marker.subject).toBe(subject);
+				expect(output).toContain("Queued nudge");
+			} else {
+				expect(output).not.toContain("Queued nudge");
+			}
+
+			output = "";
+			await mailCommand(["check", "--inject", "--agent", matrixCase.to]);
+			expect(output).toContain(subject);
+			expect(output).toContain(body);
+
+			if (matrixCase.expectsNudge) {
+				expect(output).toContain("PRIORITY");
+				expect(output).toContain(matrixCase.expectedReason ?? "");
+			} else {
+				expect(output).not.toContain("PRIORITY");
+			}
+		}
+	});
+});

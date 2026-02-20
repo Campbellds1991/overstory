@@ -84,24 +84,12 @@ const BASE_CONFIG: OverstoryConfig = {
 	logging: { verbose: false, redactSecrets: true },
 };
 
-function makeRegistrySpy() {
+function makeRegistrySpy(options: {
+	resolution: ProviderModelResolution;
+	launch: ProviderLaunchSpec;
+}) {
 	const calls: BuildProviderLaunchInput[] = [];
-	const resolution: ProviderModelResolution = {
-		modelRef: "sonnet",
-		model: "sonnet",
-		providerName: null,
-		adapterKind: "native",
-	};
-	const launch: ProviderLaunchSpec = {
-		command: "claude --model sonnet --dangerously-skip-permissions",
-		env: {},
-		startup: {
-			waitForTuiReady: true,
-			initialDelayMs: 1000,
-			followupEnterDelaysMs: [1000, 2000],
-		},
-		resolution,
-	};
+	const { resolution, launch } = options;
 
 	const registry: ProviderRegistry = {
 		resolveModel(_input: ResolveProviderModelInput): ProviderModelResolution {
@@ -116,47 +104,114 @@ function makeRegistrySpy() {
 	return { registry, calls, launch };
 }
 
-describe("provider-command integration helpers", () => {
-	test("resolveSlingLaunch wires capability role + worker startup profile", () => {
-		const { registry, calls, launch } = makeRegistrySpy();
-		const result = resolveSlingLaunch(registry, BASE_CONFIG, BASE_MANIFEST, "builder", "sonnet");
-		expect(result).toBe(launch);
-		expect(calls).toHaveLength(1);
-		expect(calls[0]?.role).toBe("builder");
-		expect(calls[0]?.fallback).toBe("sonnet");
-		expect(calls[0]?.startupProfile).toBe("worker");
-	});
+describe("provider-command integration regression matrix", () => {
+	const providerMatrix: Array<{
+		name: string;
+		resolution: ProviderModelResolution;
+	}> = [
+		{
+			name: "native",
+			resolution: {
+				modelRef: "sonnet",
+				model: "sonnet",
+				providerName: null,
+				adapterKind: "native",
+			},
+		},
+		{
+			name: "gateway",
+			resolution: {
+				modelRef: "anthropic/claude-3-7-sonnet",
+				model: "sonnet",
+				providerName: "openrouter",
+				adapterKind: "gateway",
+			},
+		},
+	];
 
-	test("resolveCoordinatorLaunch wires coordinator role + persistent startup profile", () => {
-		const { registry, calls, launch } = makeRegistrySpy();
-		const result = resolveCoordinatorLaunch(registry, BASE_CONFIG, BASE_MANIFEST, "coord prompt");
-		expect(result).toBe(launch);
-		expect(calls).toHaveLength(1);
-		expect(calls[0]?.role).toBe("coordinator");
-		expect(calls[0]?.fallback).toBe("opus");
-		expect(calls[0]?.startupProfile).toBe("persistent");
-		expect(calls[0]?.appendSystemPrompt).toBe("coord prompt");
-	});
+	const pathMatrix: Array<{
+		path: "sling" | "coordinator" | "supervisor" | "monitor";
+		expectedRole: string;
+		expectedFallback: string;
+		expectedStartup: "worker" | "persistent" | "monitor";
+		supportsPrompt: boolean;
+		invoke: (registry: ProviderRegistry, prompt: string) => ProviderLaunchSpec;
+	}> = [
+		{
+			path: "sling",
+			expectedRole: "builder",
+			expectedFallback: "sonnet",
+			expectedStartup: "worker",
+			supportsPrompt: false,
+			invoke: (registry) =>
+				resolveSlingLaunch(registry, BASE_CONFIG, BASE_MANIFEST, "builder", "sonnet"),
+		},
+		{
+			path: "coordinator",
+			expectedRole: "coordinator",
+			expectedFallback: "opus",
+			expectedStartup: "persistent",
+			supportsPrompt: true,
+			invoke: (registry, prompt) =>
+				resolveCoordinatorLaunch(registry, BASE_CONFIG, BASE_MANIFEST, prompt),
+		},
+		{
+			path: "supervisor",
+			expectedRole: "supervisor",
+			expectedFallback: "opus",
+			expectedStartup: "persistent",
+			supportsPrompt: true,
+			invoke: (registry, prompt) =>
+				resolveSupervisorLaunch(registry, BASE_CONFIG, BASE_MANIFEST, prompt),
+		},
+		{
+			path: "monitor",
+			expectedRole: "monitor",
+			expectedFallback: "sonnet",
+			expectedStartup: "monitor",
+			supportsPrompt: true,
+			invoke: (registry, prompt) =>
+				resolveMonitorLaunch(registry, BASE_CONFIG, BASE_MANIFEST, prompt),
+		},
+	];
 
-	test("resolveSupervisorLaunch wires supervisor role + persistent startup profile", () => {
-		const { registry, calls, launch } = makeRegistrySpy();
-		const result = resolveSupervisorLaunch(registry, BASE_CONFIG, BASE_MANIFEST, "sup prompt");
-		expect(result).toBe(launch);
-		expect(calls).toHaveLength(1);
-		expect(calls[0]?.role).toBe("supervisor");
-		expect(calls[0]?.fallback).toBe("opus");
-		expect(calls[0]?.startupProfile).toBe("persistent");
-		expect(calls[0]?.appendSystemPrompt).toBe("sup prompt");
-	});
+	test("provider x orchestration-path matrix preserves launch wiring parity", () => {
+		for (const providerCase of providerMatrix) {
+			for (const pathCase of pathMatrix) {
+				const appendSystemPrompt = `${pathCase.path} regression prompt`;
+				const launch: ProviderLaunchSpec = {
+					command: `${providerCase.name}-${pathCase.path}-launch`,
+					env: { PROVIDER_KIND: providerCase.name.toUpperCase() },
+					startup: {
+						waitForTuiReady: true,
+						initialDelayMs: 111,
+						followupEnterDelaysMs: [222, 333],
+					},
+					resolution: providerCase.resolution,
+				};
+				const { registry, calls } = makeRegistrySpy({
+					resolution: providerCase.resolution,
+					launch,
+				});
 
-	test("resolveMonitorLaunch wires monitor role + monitor startup profile", () => {
-		const { registry, calls, launch } = makeRegistrySpy();
-		const result = resolveMonitorLaunch(registry, BASE_CONFIG, BASE_MANIFEST, "monitor prompt");
-		expect(result).toBe(launch);
-		expect(calls).toHaveLength(1);
-		expect(calls[0]?.role).toBe("monitor");
-		expect(calls[0]?.fallback).toBe("sonnet");
-		expect(calls[0]?.startupProfile).toBe("monitor");
-		expect(calls[0]?.appendSystemPrompt).toBe("monitor prompt");
+				const result = pathCase.invoke(registry, appendSystemPrompt);
+				expect(result).toBe(launch);
+				expect(calls).toHaveLength(1);
+
+				const call = calls[0];
+				expect(call).toBeDefined();
+				expect(call?.config).toBe(BASE_CONFIG);
+				expect(call?.manifest).toBe(BASE_MANIFEST);
+				expect(call?.role).toBe(pathCase.expectedRole);
+				expect(call?.fallback).toBe(pathCase.expectedFallback);
+				expect(call?.startupProfile).toBe(pathCase.expectedStartup);
+
+				if (pathCase.supportsPrompt) {
+					expect(call?.appendSystemPrompt).toBe(appendSystemPrompt);
+				} else {
+					expect(call?.appendSystemPrompt).toBeUndefined();
+				}
+			}
+		}
 	});
 });
