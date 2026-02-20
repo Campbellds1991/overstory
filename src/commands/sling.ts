@@ -22,18 +22,31 @@ import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { deployHooks } from "../agents/hooks-deployer.ts";
 import { createIdentity, loadIdentity } from "../agents/identity.ts";
-import { createManifestLoader, resolveModel } from "../agents/manifest.ts";
+import { createManifestLoader } from "../agents/manifest.ts";
 import { writeOverlay } from "../agents/overlay.ts";
 import type { BeadIssue } from "../beads/client.ts";
 import { createBeadsClient } from "../beads/client.ts";
 import { loadConfig } from "../config.ts";
 import { AgentError, HierarchyError, ValidationError } from "../errors.ts";
 import { createMulchClient } from "../mulch/client.ts";
+import { createProviderRegistry } from "../providers/registry.ts";
 import { openSessionStore } from "../sessions/compat.ts";
 import { createRunStore } from "../sessions/store.ts";
-import type { AgentSession, OverlayConfig } from "../types.ts";
+import type {
+	AgentManifest,
+	AgentSession,
+	OverstoryConfig,
+	OverlayConfig,
+	ProviderLaunchSpec,
+	ProviderRegistry,
+} from "../types.ts";
 import { createWorktree } from "../worktree/manager.ts";
 import { createSession, sendKeys, waitForTuiReady } from "../worktree/tmux.ts";
+
+/** Dependency injection for provider wiring in tests. */
+export interface SlingDeps {
+	_providers?: ProviderRegistry;
+}
 
 /**
  * Calculate how many milliseconds to sleep before spawning a new agent,
@@ -169,6 +182,23 @@ export function validateHierarchy(
 	}
 }
 
+/** Resolve sling launch command/env/startup from provider registry. */
+export function resolveSlingLaunch(
+	registry: ProviderRegistry,
+	config: OverstoryConfig,
+	manifest: AgentManifest,
+	capability: string,
+	fallback: string,
+): ProviderLaunchSpec {
+	return registry.buildLaunch({
+		config,
+		manifest,
+		role: capability,
+		fallback,
+		startupProfile: "worker",
+	});
+}
+
 /**
  * Entry point for `overstory sling <task-id> [flags]`.
  *
@@ -199,7 +229,7 @@ Options:
   --json                     Output result as JSON
   --help, -h                 Show this help`;
 
-export async function slingCommand(args: string[]): Promise<void> {
+export async function slingCommand(args: string[], deps: SlingDeps = {}): Promise<void> {
 	if (args.includes("--help") || args.includes("-h")) {
 		process.stdout.write(`${SLING_HELP}\n`);
 		return;
@@ -264,6 +294,7 @@ export async function slingCommand(args: string[]): Promise<void> {
 	// 1. Load config
 	const cwd = process.cwd();
 	const config = await loadConfig(cwd);
+	const providers = deps._providers ?? createProviderRegistry();
 
 	// 2. Validate depth limit
 	// Hierarchy: orchestrator(0) -> lead(1) -> specialist(2)
@@ -464,10 +495,9 @@ export async function slingCommand(args: string[]): Promise<void> {
 
 		// 12. Create tmux session running claude in interactive mode
 		const tmuxSessionName = `overstory-${config.project.name}-${name}`;
-		const { model, env } = resolveModel(config, manifest, capability, agentDef.model);
-		const claudeCmd = `claude --model ${model} --dangerously-skip-permissions`;
-		const pid = await createSession(tmuxSessionName, worktreePath, claudeCmd, {
-			...env,
+		const launch = resolveSlingLaunch(providers, config, manifest, capability, agentDef.model);
+		const pid = await createSession(tmuxSessionName, worktreePath, launch.command, {
+			...launch.env,
 			OVERSTORY_AGENT_NAME: name,
 			OVERSTORY_WORKTREE_PATH: worktreePath,
 		});
@@ -508,9 +538,12 @@ export async function slingCommand(args: string[]): Promise<void> {
 		// 13b. Wait for Claude Code TUI to render before sending input.
 		// Polling capture-pane is more reliable than a fixed sleep because
 		// TUI init time varies by machine load and model state.
-		await waitForTuiReady(tmuxSessionName);
-		// Buffer for the input handler to attach after initial render
-		await Bun.sleep(1_000);
+		if (launch.startup.waitForTuiReady) {
+			await waitForTuiReady(tmuxSessionName);
+		}
+		if (launch.startup.initialDelayMs > 0) {
+			await Bun.sleep(launch.startup.initialDelayMs);
+		}
 
 		const beacon = buildBeacon({
 			agentName: name,
@@ -524,7 +557,7 @@ export async function slingCommand(args: string[]): Promise<void> {
 		// 13c. Follow-up Enters with increasing delays to ensure submission.
 		// Claude Code's TUI may consume early Enters during late initialization
 		// (overstory-yhv6). An Enter on an empty input line is harmless.
-		for (const delay of [1_000, 2_000]) {
+		for (const delay of launch.startup.followupEnterDelaysMs) {
 			await Bun.sleep(delay);
 			await sendKeys(tmuxSessionName, "");
 		}

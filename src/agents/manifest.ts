@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { AgentError } from "../errors.ts";
+import { createProviderRegistry, resolveGatewayProviderEnv } from "../providers/registry.ts";
 import type {
 	AgentDefinition,
 	AgentManifest,
@@ -31,8 +32,6 @@ interface RawManifest {
 	agents?: unknown;
 	capabilityIndex?: unknown;
 }
-
-const MODEL_ALIASES = new Set(["sonnet", "opus", "haiku"]);
 
 /**
  * Validate that a raw parsed object conforms to the AgentDefinition shape.
@@ -279,8 +278,6 @@ export function createManifestLoader(manifestPath: string, agentBaseDir: string)
 	};
 }
 
-const DEFAULT_GATEWAY_ALIAS = "sonnet";
-
 /**
  * Resolve provider-specific environment variables for a gateway provider.
  *
@@ -293,27 +290,7 @@ export function resolveProviderEnv(
 	providers: Record<string, ProviderConfig>,
 	env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
 ): Record<string, string> | null {
-	const provider = providers[providerName];
-	if (!provider || provider.type !== "gateway") return null;
-	if (!provider.baseUrl) return null;
-
-	const alias = DEFAULT_GATEWAY_ALIAS;
-	const aliasUpper = alias.toUpperCase();
-
-	const result: Record<string, string> = {
-		ANTHROPIC_BASE_URL: provider.baseUrl,
-		ANTHROPIC_API_KEY: "",
-		[`ANTHROPIC_DEFAULT_${aliasUpper}_MODEL`]: modelId,
-	};
-
-	if (provider.authTokenEnv) {
-		const token = env[provider.authTokenEnv];
-		if (token) {
-			result.ANTHROPIC_AUTH_TOKEN = token;
-		}
-	}
-
-	return result;
+	return resolveGatewayProviderEnv(providerName, modelId, providers, env);
 }
 
 /**
@@ -330,25 +307,11 @@ export function resolveModel(
 	role: string,
 	fallback: string,
 ): ResolvedModel {
-	const configModel = config.models[role];
-	const rawModel = configModel ?? manifest.agents[role]?.model ?? fallback;
-
-	// Simple alias — no provider env needed
-	if (MODEL_ALIASES.has(rawModel)) {
-		return { model: rawModel };
-	}
-
-	// Provider-prefixed: split on first "/" to get provider name and model ID
-	const slashIdx = rawModel.indexOf("/");
-	if (slashIdx > 0) {
-		const providerName = rawModel.substring(0, slashIdx);
-		const modelId = rawModel.substring(slashIdx + 1);
-		const providerEnv = resolveProviderEnv(providerName, modelId, config.providers);
-		if (providerEnv) {
-			return { model: DEFAULT_GATEWAY_ALIAS, env: providerEnv };
-		}
-	}
-
-	// Unknown format — return as-is (may be a direct model string)
-	return { model: rawModel };
+	const resolution = createProviderRegistry().resolveModel({
+		config,
+		manifest,
+		role,
+		fallback,
+	});
+	return resolution.env ? { model: resolution.model, env: resolution.env } : { model: resolution.model };
 }

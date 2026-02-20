@@ -22,6 +22,63 @@ export interface ResolvedModel {
 	env?: Record<string, string>;
 }
 
+/** Named launch startup profiles consumed by provider registries/adapters. */
+export type ProviderStartupProfileName = "worker" | "persistent" | "monitor";
+
+/** Launch readiness and input-submission timing semantics. */
+export interface ProviderStartupSemantics {
+	waitForTuiReady: boolean;
+	initialDelayMs: number;
+	followupEnterDelaysMs: number[];
+}
+
+/** Provider-resolved model metadata used for launch decisions and testing. */
+export interface ProviderModelResolution extends ResolvedModel {
+	modelRef: string;
+	providerName: string | null;
+	adapterKind: ProviderConfig["type"];
+}
+
+/** Inputs for resolving a role's model through the provider registry. */
+export interface ResolveProviderModelInput {
+	config: OverstoryConfig;
+	manifest: AgentManifest;
+	role: string;
+	fallback: string;
+}
+
+/** Inputs for building a launch command/env/startup plan through providers. */
+export interface BuildProviderLaunchInput extends ResolveProviderModelInput {
+	startupProfile: ProviderStartupProfileName;
+	appendSystemPrompt?: string;
+}
+
+/** Launch payload returned by provider registries. */
+export interface ProviderLaunchSpec {
+	command: string;
+	env: Record<string, string>;
+	startup: ProviderStartupSemantics;
+	resolution: ProviderModelResolution;
+}
+
+/** Provider adapter contract for model resolution and command construction. */
+export interface ProviderAdapter {
+	readonly kind: ProviderConfig["type"];
+	resolveModel(
+		modelRef: string,
+		providerName: string | null,
+		providers: Record<string, ProviderConfig>,
+		env?: Record<string, string | undefined>,
+	): ResolvedModel;
+	buildCommand(model: string, appendSystemPrompt?: string): string;
+}
+
+/** Provider registry contract for selecting adapters and building launch specs. */
+export interface ProviderRegistry {
+	resolveModel(input: ResolveProviderModelInput): ProviderModelResolution;
+	buildLaunch(input: BuildProviderLaunchInput): ProviderLaunchSpec;
+}
+
 // === Project Configuration ===
 
 export interface OverstoryConfig {

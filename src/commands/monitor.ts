@@ -17,13 +17,31 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { deployHooks } from "../agents/hooks-deployer.ts";
 import { createIdentity, loadIdentity } from "../agents/identity.ts";
-import { createManifestLoader, resolveModel } from "../agents/manifest.ts";
+import { createManifestLoader } from "../agents/manifest.ts";
 import { loadConfig } from "../config.ts";
 import { AgentError, ValidationError } from "../errors.ts";
+import { createProviderRegistry } from "../providers/registry.ts";
 import { openSessionStore } from "../sessions/compat.ts";
-import type { AgentSession } from "../types.ts";
-import { createSession, isSessionAlive, killSession, sendKeys } from "../worktree/tmux.ts";
+import type {
+	AgentManifest,
+	AgentSession,
+	OverstoryConfig,
+	ProviderLaunchSpec,
+	ProviderRegistry,
+} from "../types.ts";
+import {
+	createSession,
+	isSessionAlive,
+	killSession,
+	sendKeys,
+	waitForTuiReady,
+} from "../worktree/tmux.ts";
 import { isRunningAsRoot } from "./sling.ts";
+
+/** Dependency injection for provider wiring in tests. */
+export interface MonitorDeps {
+	_providers?: ProviderRegistry;
+}
 
 /** Default monitor agent name. */
 const MONITOR_NAME = "monitor";
@@ -50,6 +68,23 @@ export function buildMonitorBeacon(): string {
 	return parts.join(" — ");
 }
 
+/** Resolve monitor launch command/env/startup from provider registry. */
+export function resolveMonitorLaunch(
+	registry: ProviderRegistry,
+	config: OverstoryConfig,
+	manifest: AgentManifest,
+	appendSystemPrompt?: string,
+): ProviderLaunchSpec {
+	return registry.buildLaunch({
+		config,
+		manifest,
+		role: "monitor",
+		fallback: "sonnet",
+		startupProfile: "monitor",
+		appendSystemPrompt,
+	});
+}
+
 /**
  * Determine whether to auto-attach to the tmux session after starting.
  */
@@ -70,7 +105,7 @@ function resolveAttach(args: string[], isTTY: boolean): boolean {
  * 6. Send startup beacon
  * 7. Record session in SessionStore (sessions.db)
  */
-async function startMonitor(args: string[]): Promise<void> {
+async function startMonitor(args: string[], deps: MonitorDeps = {}): Promise<void> {
 	const json = args.includes("--json");
 	const shouldAttach = resolveAttach(args, !!process.stdout.isTTY);
 
@@ -82,6 +117,7 @@ async function startMonitor(args: string[]): Promise<void> {
 
 	const cwd = process.cwd();
 	const config = await loadConfig(cwd);
+	const providers = deps._providers ?? createProviderRegistry();
 
 	// Gate on tier2Enabled config flag
 	if (!config.watchdog.tier2Enabled) {
@@ -143,20 +179,18 @@ async function startMonitor(args: string[]): Promise<void> {
 			join(projectRoot, config.agents.baseDir),
 		);
 		const manifest = await manifestLoader.load();
-		const { model, env } = resolveModel(config, manifest, "monitor", "sonnet");
 
 		// Spawn tmux session at project root with Claude Code (interactive mode).
 		// Inject the monitor base definition via --append-system-prompt.
 		const agentDefPath = join(projectRoot, ".overstory", "agent-defs", "monitor.md");
 		const agentDefFile = Bun.file(agentDefPath);
-		let claudeCmd = `claude --model ${model} --dangerously-skip-permissions`;
+		let appendSystemPrompt: string | undefined;
 		if (await agentDefFile.exists()) {
-			const agentDef = await agentDefFile.text();
-			const escaped = agentDef.replace(/'/g, "'\\''");
-			claudeCmd += ` --append-system-prompt '${escaped}'`;
+			appendSystemPrompt = await agentDefFile.text();
 		}
-		const pid = await createSession(tmuxSession, projectRoot, claudeCmd, {
-			...env,
+		const launch = resolveMonitorLaunch(providers, config, manifest, appendSystemPrompt);
+		const pid = await createSession(tmuxSession, projectRoot, launch.command, {
+			...launch.env,
 			OVERSTORY_AGENT_NAME: MONITOR_NAME,
 		});
 
@@ -183,14 +217,19 @@ async function startMonitor(args: string[]): Promise<void> {
 
 		store.upsert(session);
 
-		// Send beacon after TUI initialization delay
-		await Bun.sleep(3_000);
+		if (launch.startup.waitForTuiReady) {
+			await waitForTuiReady(tmuxSession);
+		}
+		if (launch.startup.initialDelayMs > 0) {
+			await Bun.sleep(launch.startup.initialDelayMs);
+		}
 		const beacon = buildMonitorBeacon();
 		await sendKeys(tmuxSession, beacon);
 
-		// Follow-up Enter to ensure submission (same pattern as sling.ts)
-		await Bun.sleep(500);
-		await sendKeys(tmuxSession, "");
+		for (const delay of launch.startup.followupEnterDelaysMs) {
+			await Bun.sleep(delay);
+			await sendKeys(tmuxSession, "");
+		}
 
 		const output = {
 			agentName: MONITOR_NAME,
@@ -362,7 +401,7 @@ The monitor agent (Tier 2) continuously patrols the agent fleet by:
 /**
  * Entry point for `overstory monitor <subcommand>`.
  */
-export async function monitorCommand(args: string[]): Promise<void> {
+export async function monitorCommand(args: string[], deps: MonitorDeps = {}): Promise<void> {
 	if (args.includes("--help") || args.includes("-h") || args.length === 0) {
 		process.stdout.write(`${MONITOR_HELP}\n`);
 		return;
@@ -373,7 +412,7 @@ export async function monitorCommand(args: string[]): Promise<void> {
 
 	switch (subcommand) {
 		case "start":
-			await startMonitor(subArgs);
+			await startMonitor(subArgs, deps);
 			break;
 		case "stop":
 			await stopMonitor(subArgs);
