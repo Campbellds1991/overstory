@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { createEventStore } from "../events/store.ts";
 import { createMailClient } from "../mail/client.ts";
 import { createMailStore } from "../mail/store.ts";
+import { createSessionStore } from "../sessions/store.ts";
 import type { StoredEvent } from "../types.ts";
 import { mailCommand } from "./mail.ts";
 
@@ -20,10 +21,13 @@ describe("mailCommand", () => {
 	let origCwd: string;
 	let origWrite: typeof process.stdout.write;
 	let origStderrWrite: typeof process.stderr.write;
+	let origAgentEnv: string | undefined;
 	let output: string;
 	let stderrOutput: string;
 
 	beforeEach(async () => {
+		origAgentEnv = process.env.OVERSTORY_AGENT_NAME;
+		delete process.env.OVERSTORY_AGENT_NAME;
 		tempDir = await mkdtemp(join(tmpdir(), "overstory-mail-cmd-test-"));
 		await mkdir(join(tempDir, ".overstory"), { recursive: true });
 
@@ -68,6 +72,11 @@ describe("mailCommand", () => {
 	afterEach(async () => {
 		process.stdout.write = origWrite;
 		process.stderr.write = origStderrWrite;
+		if (origAgentEnv === undefined) {
+			delete process.env.OVERSTORY_AGENT_NAME;
+		} else {
+			process.env.OVERSTORY_AGENT_NAME = origAgentEnv;
+		}
 		process.chdir(origCwd);
 		await rm(tempDir, { recursive: true, force: true });
 	});
@@ -247,6 +256,72 @@ describe("mailCommand", () => {
 		});
 	});
 
+	describe("wait", () => {
+		test("wait returns immediately when unread mail exists", async () => {
+			output = "";
+			await mailCommand(["wait", "--agent", "builder-1", "--timeout", "50", "--poll", "1"]);
+
+			expect(output).toContain('Waiting for mail for "builder-1"');
+			expect(output).toContain("Mail wait woke");
+			expect(output).toContain("Build task");
+		});
+
+		test("wait times out with clear status when no mail arrives", async () => {
+			output = "";
+			await mailCommand([
+				"wait",
+				"--agent",
+				"no-mail-agent",
+				"--timeout",
+				"25",
+				"--poll",
+				"1",
+				"--status-every",
+				"50",
+			]);
+
+			expect(output).toContain('Waiting for mail for "no-mail-agent"');
+			expect(output).toContain("Timed out waiting for mail");
+		});
+
+		test("wait falls back to OVERSTORY_AGENT_NAME when --agent is omitted", async () => {
+			process.env.OVERSTORY_AGENT_NAME = "scout-1";
+
+			output = "";
+			await mailCommand(["wait", "--timeout", "50", "--poll", "1"]);
+
+			expect(output).toContain('Waiting for mail for "scout-1"');
+			expect(output).toContain("Explore API");
+		});
+
+		test("wait wakes on pending nudge marker even with no unread messages", async () => {
+			const markerDir = join(tempDir, ".overstory", "pending-nudges");
+			await mkdir(markerDir, { recursive: true });
+			const markerPath = join(markerDir, "wake-agent.json");
+			await Bun.write(
+				markerPath,
+				`${JSON.stringify(
+					{
+						from: "watchdog",
+						reason: "unread mail",
+						subject: "Check inbox",
+						messageId: "msg-wake",
+						createdAt: new Date().toISOString(),
+					},
+					null,
+					"\t",
+				)}\n`,
+			);
+
+			output = "";
+			await mailCommand(["wait", "--agent", "wake-agent", "--timeout", "50", "--poll", "1"]);
+
+			expect(output).toContain("Wake nudge");
+			expect(output).toContain("No unread messages were found after wake signal.");
+			expect(await Bun.file(markerPath).exists()).toBe(false);
+		});
+	});
+
 	describe("auto-nudge (pending nudge markers)", () => {
 		test("urgent message writes pending nudge marker instead of tmux keys", async () => {
 			await mailCommand([
@@ -406,6 +481,95 @@ describe("mailCommand", () => {
 			const parsed = JSON.parse(output.trim());
 			expect(parsed.id).toBeTruthy();
 			expect(output).not.toContain("Queued nudge");
+		});
+	});
+
+	describe("session heartbeat refresh", () => {
+		test("mail check refreshes lastActivity and recovers stalled sessions to working", async () => {
+			const sessionsDbPath = join(tempDir, ".overstory", "sessions.db");
+			const oldActivity = new Date(Date.now() - 120_000).toISOString();
+
+			const sessionStore = createSessionStore(sessionsDbPath);
+			sessionStore.upsert({
+				id: "session-builder-1",
+				agentName: "builder-1",
+				capability: "builder",
+				worktreePath: "/worktrees/builder-1",
+				branchName: "builder-1",
+				beadId: "bead-001",
+				tmuxSession: "overstory-test-builder-1",
+				state: "stalled",
+				pid: 12345,
+				parentAgent: "orchestrator",
+				depth: 1,
+				runId: "run-001",
+				startedAt: oldActivity,
+				lastActivity: oldActivity,
+				escalationLevel: 2,
+				stalledSince: oldActivity,
+			});
+			sessionStore.close();
+
+			output = "";
+			await mailCommand(["check", "--agent", "builder-1"]);
+
+			const sessionStore2 = createSessionStore(sessionsDbPath);
+			const updated = sessionStore2.getByName("builder-1");
+			sessionStore2.close();
+
+			expect(updated).toBeTruthy();
+			expect(updated?.state).toBe("working");
+			expect(updated?.escalationLevel).toBe(0);
+			expect(updated?.stalledSince).toBeNull();
+			expect(new Date(updated?.lastActivity ?? 0).getTime()).toBeGreaterThan(
+				new Date(oldActivity).getTime(),
+			);
+		});
+
+		test("mail send uses agent env fallback and refreshes booting session state", async () => {
+			const sessionsDbPath = join(tempDir, ".overstory", "sessions.db");
+			const oldActivity = new Date(Date.now() - 120_000).toISOString();
+
+			const sessionStore = createSessionStore(sessionsDbPath);
+			sessionStore.upsert({
+				id: "session-scout-1",
+				agentName: "scout-1",
+				capability: "scout",
+				worktreePath: "/worktrees/scout-1",
+				branchName: "scout-1",
+				beadId: "bead-002",
+				tmuxSession: "overstory-test-scout-1",
+				state: "booting",
+				pid: 12346,
+				parentAgent: "orchestrator",
+				depth: 1,
+				runId: "run-001",
+				startedAt: oldActivity,
+				lastActivity: oldActivity,
+				escalationLevel: 0,
+				stalledSince: null,
+			});
+			sessionStore.close();
+
+			process.env.OVERSTORY_AGENT_NAME = "scout-1";
+			output = "";
+			await mailCommand(["send", "--to", "builder-1", "--subject", "Env sender", "--body", "Ping"]);
+
+			const sessionStore2 = createSessionStore(sessionsDbPath);
+			const updated = sessionStore2.getByName("scout-1");
+			sessionStore2.close();
+			expect(updated).toBeTruthy();
+			expect(updated?.state).toBe("working");
+			expect(new Date(updated?.lastActivity ?? 0).getTime()).toBeGreaterThan(
+				new Date(oldActivity).getTime(),
+			);
+
+			const mailStore = createMailStore(join(tempDir, ".overstory", "mail.db"));
+			const client = createMailClient(mailStore);
+			const sent = client.list().find((m) => m.subject === "Env sender");
+			client.close();
+			expect(sent).toBeDefined();
+			expect(sent?.from).toBe("scout-1");
 		});
 	});
 
