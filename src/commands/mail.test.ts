@@ -716,6 +716,112 @@ describe("mailCommand", () => {
 			expect(sent).toBeDefined();
 			expect(sent?.from).toBe("scout-1");
 		});
+
+		test("mail send validation errors do not refresh stalled session heartbeat", async () => {
+			const sessionsDbPath = join(tempDir, ".overstory", "sessions.db");
+			const oldActivity = new Date(Date.now() - 120_000).toISOString();
+
+			const sessionStore = createSessionStore(sessionsDbPath);
+			sessionStore.upsert({
+				id: "session-send-invalid",
+				agentName: "send-invalid-agent",
+				capability: "builder",
+				worktreePath: "/worktrees/send-invalid-agent",
+				branchName: "send-invalid-agent",
+				beadId: "bead-send-invalid",
+				tmuxSession: "overstory-test-send-invalid-agent",
+				state: "stalled",
+				pid: 12347,
+				parentAgent: "orchestrator",
+				depth: 1,
+				runId: "run-001",
+				startedAt: oldActivity,
+				lastActivity: oldActivity,
+				escalationLevel: 2,
+				stalledSince: oldActivity,
+			});
+			sessionStore.close();
+
+			let err: Error | null = null;
+			try {
+				await mailCommand([
+					"send",
+					"--agent",
+					"send-invalid-agent",
+					"--subject",
+					"Missing recipient",
+					"--body",
+					"This should fail validation",
+				]);
+			} catch (error) {
+				err = error as Error;
+			}
+
+			expect(err).toBeTruthy();
+			expect(err?.message).toContain("--to is required for mail send");
+
+			const sessionStore2 = createSessionStore(sessionsDbPath);
+			const updated = sessionStore2.getByName("send-invalid-agent");
+			sessionStore2.close();
+
+			expect(updated).toBeTruthy();
+			expect(updated?.state).toBe("stalled");
+			expect(updated?.escalationLevel).toBe(2);
+			expect(updated?.stalledSince).toBe(oldActivity);
+			expect(updated?.lastActivity).toBe(oldActivity);
+		});
+
+		test("mail reply validation errors do not refresh stalled session heartbeat", async () => {
+			const sessionsDbPath = join(tempDir, ".overstory", "sessions.db");
+			const oldActivity = new Date(Date.now() - 120_000).toISOString();
+
+			const sessionStore = createSessionStore(sessionsDbPath);
+			sessionStore.upsert({
+				id: "session-reply-invalid",
+				agentName: "reply-invalid-agent",
+				capability: "builder",
+				worktreePath: "/worktrees/reply-invalid-agent",
+				branchName: "reply-invalid-agent",
+				beadId: "bead-reply-invalid",
+				tmuxSession: "overstory-test-reply-invalid-agent",
+				state: "stalled",
+				pid: 12348,
+				parentAgent: "orchestrator",
+				depth: 1,
+				runId: "run-001",
+				startedAt: oldActivity,
+				lastActivity: oldActivity,
+				escalationLevel: 3,
+				stalledSince: oldActivity,
+			});
+			sessionStore.close();
+
+			let err: Error | null = null;
+			try {
+				await mailCommand([
+					"reply",
+					"--agent",
+					"reply-invalid-agent",
+					"--body",
+					"Missing message ID should fail validation",
+				]);
+			} catch (error) {
+				err = error as Error;
+			}
+
+			expect(err).toBeTruthy();
+			expect(err?.message).toContain("Message ID is required for mail reply");
+
+			const sessionStore2 = createSessionStore(sessionsDbPath);
+			const updated = sessionStore2.getByName("reply-invalid-agent");
+			sessionStore2.close();
+
+			expect(updated).toBeTruthy();
+			expect(updated?.state).toBe("stalled");
+			expect(updated?.escalationLevel).toBe(3);
+			expect(updated?.stalledSince).toBe(oldActivity);
+			expect(updated?.lastActivity).toBe(oldActivity);
+		});
 	});
 
 	describe("mail_sent event recording", () => {

@@ -20,6 +20,7 @@
  * truth. See health.ts for the full ZFC documentation.
  */
 
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { createBeadsClient } from "../beads/client.ts";
 import { nudgeAgent } from "../commands/nudge.ts";
@@ -43,6 +44,18 @@ const PERSISTENT_CAPABILITIES = new Set(["coordinator", "monitor"]);
 
 /** Bead statuses that indicate work is fully closed. */
 const CLOSED_BEAD_STATUSES = new Set(["closed", "done", "completed", "resolved"]);
+
+/**
+ * Check whether bead polling should be enabled for this root.
+ *
+ * Watchdog should only shell out to `bd` when running from an authoritative
+ * project workspace that also has a bead workspace initialized.
+ */
+function hasAuthoritativeBeadWorkspace(root: string): boolean {
+	const overstoryDir = join(root, ".overstory");
+	const beadsDir = join(root, ".beads");
+	return existsSync(overstoryDir) && existsSync(beadsDir);
+}
 
 /**
  * Read unread mail count for an agent from mail.db.
@@ -91,6 +104,9 @@ function resolveBeadStatusReader(
 	const bunWithWhich = Bun as unknown as { which?: (cmd: string) => string | null };
 	const hasBd = bunWithWhich.which ? bunWithWhich.which("bd") !== null : true;
 	if (!hasBd) {
+		return null;
+	}
+	if (!hasAuthoritativeBeadWorkspace(root)) {
 		return null;
 	}
 

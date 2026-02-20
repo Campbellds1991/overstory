@@ -328,8 +328,6 @@ async function handleSend(args: string[], cwd: string): Promise<void> {
 	const rawType = getFlag(args, "--type") ?? "status";
 	const rawPriority = getFlag(args, "--priority") ?? "normal";
 
-	refreshSessionHeartbeat(cwd, from);
-
 	if (!MAIL_MESSAGE_TYPES.includes(rawType as MailMessage["type"])) {
 		throw new ValidationError(
 			`Invalid --type "${rawType}". Must be one of: ${MAIL_MESSAGE_TYPES.join(", ")}`,
@@ -369,6 +367,8 @@ async function handleSend(args: string[], cwd: string): Promise<void> {
 	if (!body) {
 		throw new ValidationError("--body is required for mail send", { field: "body" });
 	}
+
+	refreshSessionHeartbeat(cwd, from);
 
 	// Handle broadcast messages (group addresses)
 	if (isGroupAddress(to)) {
@@ -892,14 +892,14 @@ function handleReply(args: string[], cwd: string): void {
 	const body = getFlag(args, "--body");
 	const from = resolveAgentName(args, ["--agent", "--from"]);
 
-	refreshSessionHeartbeat(cwd, from);
-
 	if (!id) {
 		throw new ValidationError("Message ID is required for mail reply", { field: "id" });
 	}
 	if (!body) {
 		throw new ValidationError("--body is required for mail reply", { field: "body" });
 	}
+
+	refreshSessionHeartbeat(cwd, from);
 
 	const client = openClient(cwd);
 	try {

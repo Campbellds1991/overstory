@@ -17,7 +17,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEventStore } from "../events/store.ts";
@@ -197,6 +197,43 @@ function beadStatusTracker(statusMap: Record<string, string>): {
 	};
 }
 
+/**
+ * Install a fake `bd` binary at the front of PATH that records invocations.
+ */
+async function installFakeBd(
+	root: string,
+	markerPath: string,
+	status: "open" | "closed" = "open",
+): Promise<{ restore: () => void }> {
+	const fakeBinDir = join(root, "fake-bin");
+	const fakeBdPath = join(fakeBinDir, "bd");
+	await mkdir(fakeBinDir, { recursive: true });
+	await writeFile(
+		fakeBdPath,
+		`#!/bin/sh
+echo "$@" >> "${markerPath}"
+if [ "$1" = "show" ]; then
+	printf '[{"id":"%s","title":"Fake","status":"${status}","priority":1,"issue_type":"task"}]\n' "$2"
+	exit 0
+fi
+printf '[]\n'
+`,
+		{ mode: 0o755 },
+	);
+
+	const originalPath = process.env.PATH;
+	process.env.PATH = `${fakeBinDir}${originalPath ? `:${originalPath}` : ""}`;
+	return {
+		restore: () => {
+			if (originalPath === undefined) {
+				delete process.env.PATH;
+			} else {
+				process.env.PATH = originalPath;
+			}
+		},
+	};
+}
+
 // === Tests ===
 
 let tempRoot: string;
@@ -330,6 +367,69 @@ describe("daemon tick", () => {
 		// Session persisted as zombie
 		const reloaded = readSessionsFromStore(tempRoot);
 		expect(reloaded[0]?.state).toBe("zombie");
+	});
+
+	test("does not poll bead status without authoritative bead workspace even when bd is on PATH", async () => {
+		const session = makeSession({
+			agentName: "no-beads-workspace-agent",
+			beadId: "bead-workspace-missing-1",
+			tmuxSession: "overstory-no-beads-workspace-agent",
+			state: "working",
+			lastActivity: new Date().toISOString(),
+		});
+		writeSessionsToStore(tempRoot, [session]);
+
+		const markerPath = join(tempRoot, "fake-bd-calls.log");
+		const fakeBd = await installFakeBd(tempRoot, markerPath, "open");
+		try {
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				_tmux: tmuxAllAlive(),
+				_triage: triageAlways("extend"),
+				_nudge: nudgeTracker().nudge,
+			});
+		} finally {
+			fakeBd.restore();
+		}
+
+		expect(await Bun.file(markerPath).exists()).toBe(false);
+		const reloaded = readSessionsFromStore(tempRoot);
+		expect(reloaded[0]?.state).toBe("working");
+	});
+
+	test("polls bead status when authoritative bead workspace is present and bd is on PATH", async () => {
+		const session = makeSession({
+			agentName: "with-beads-workspace-agent",
+			beadId: "bead-workspace-present-1",
+			tmuxSession: "overstory-with-beads-workspace-agent",
+			state: "working",
+			lastActivity: new Date().toISOString(),
+		});
+		writeSessionsToStore(tempRoot, [session]);
+		await mkdir(join(tempRoot, ".beads"), { recursive: true });
+
+		const markerPath = join(tempRoot, "fake-bd-calls.log");
+		const fakeBd = await installFakeBd(tempRoot, markerPath, "open");
+		try {
+			await runDaemonTick({
+				root: tempRoot,
+				...THRESHOLDS,
+				_tmux: tmuxAllAlive(),
+				_triage: triageAlways("extend"),
+				_nudge: nudgeTracker().nudge,
+			});
+		} finally {
+			fakeBd.restore();
+		}
+
+		expect(await Bun.file(markerPath).exists()).toBe(true);
+		const lines = (await Bun.file(markerPath).text())
+			.split("\n")
+			.map((line) => line.trim())
+			.filter((line) => line.length > 0);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain("show bead-workspace-present-1 --json");
 	});
 
 	test("auto-completes session when linked bead is closed", async () => {
