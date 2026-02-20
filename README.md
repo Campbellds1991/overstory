@@ -94,6 +94,12 @@ overstory nudge <agent-name>
 overstory mail check --inject
 ```
 
+## Documentation
+
+- [Architecture guide](docs/architecture.md) — provider contracts, hook contracts, DI boundaries, and command ownership.
+- [Migration guide](docs/migration-guide.md) — how to integrate or change providers and hook implementations safely.
+- [Contributor checklist](docs/contributor-checklist.md) — PR slicing guidance and acceptance-criteria template.
+
 ## CLI Reference
 
 ```
