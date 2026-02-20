@@ -46,13 +46,32 @@ const HOOK_EVENT_KEYS = [
 
 const ENV_GUARD = '[ -z "$OVERSTORY_AGENT_NAME" ] && exit 0;';
 
+function normalizeShellArgs(input: string): string {
+	return input.trim().replace(/\s+/g, " ");
+}
+
 function normalizeLogCommand(
 	command: string,
 	eventName: "tool-start" | "tool-end" | "session-end",
 	context: HookPolicyContext,
 ): string {
-	const agentMatch = command.match(/overstory log [a-z-]+ --agent ([^ ;]+)/);
+	const logArgsMatch = command.match(/overstory log [a-z-]+([^;]*)/);
+	const logArgs = logArgsMatch?.[1] ?? "";
+
+	const agentMatch = logArgs.match(/(?:^|\s)--agent\s+([^ ;]+)/);
+	if (logArgs.includes("--agent") && !agentMatch) {
+		throw new Error(
+			`Unable to normalize overstory log command: unsupported --agent syntax in "${command}"`,
+		);
+	}
 	const agentName = agentMatch?.[1] ?? context.agentName;
+
+	const trailingArgs = normalizeShellArgs(
+		logArgs
+			.replace(/(?:^|\s)--agent\s+[^ ;]+/g, " ")
+			.replace(/(?:^|\s)--stdin(?=\s|$)/g, " "),
+	);
+	const trailingArgsSuffix = trailingArgs.length > 0 ? ` ${trailingArgs}` : "";
 
 	const needsEnvGuard =
 		context.target === "agent" ||
@@ -60,7 +79,7 @@ function normalizeLogCommand(
 		command.includes("OVERSTORY_AGENT_NAME");
 	const prefix = needsEnvGuard ? `${ENV_GUARD} ` : "";
 
-	return `${prefix}overstory log ${eventName} --agent ${agentName} --stdin`;
+	return `${prefix}overstory log ${eventName} --agent ${agentName} --stdin${trailingArgsSuffix}`;
 }
 
 function normalizeCommand(command: string, context: HookPolicyContext): string {

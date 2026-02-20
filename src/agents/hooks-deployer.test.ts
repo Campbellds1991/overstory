@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentError } from "../errors.ts";
-import type { HookProviderKind } from "./hooks-policy.ts";
+import { resolveHookAdapter, type HookProviderKind } from "./hooks-policy.ts";
 import {
 	buildBashFileGuardScript,
 	buildBashPathBoundaryScript,
@@ -1951,5 +1951,107 @@ describe("hook parity regression matrix (provider/runtime x capability tiers)", 
 				}
 			}
 		}
+	});
+});
+
+describe("hook log normalization", () => {
+	const providerKinds: HookProviderKind[] = ["native", "gateway"];
+
+	test("preserves custom trailing args/options for tool-start/tool-end/session-end", () => {
+		for (const providerKind of providerKinds) {
+			const adapter = resolveHookAdapter(providerKind);
+			const normalized = adapter.normalize(
+				{
+					hooks: {
+						PreToolUse: [
+							{
+								matcher: "",
+								hooks: [
+									{
+										type: "command",
+										command:
+											'overstory log tool-start --agent custom-agent --trace-id 42 --format json',
+									},
+								],
+							},
+						],
+						PostToolUse: [
+							{
+								matcher: "",
+								hooks: [
+									{
+										type: "command",
+										command:
+											'overstory log tool-end --agent custom-agent --trace-id 84 --format json',
+									},
+								],
+							},
+						],
+						Stop: [
+							{
+								matcher: "",
+								hooks: [
+									{
+										type: "command",
+										command:
+											'overstory log session-end --agent custom-agent --trace-id 126 --format json',
+									},
+								],
+							},
+						],
+					},
+				},
+				{
+					agentName: "context-agent",
+					capability: "builder",
+					providerKind,
+					target: "agent",
+				},
+			);
+
+			const preToolUseBase = normalized.hooks.PreToolUse.find((entry) => entry.matcher === "");
+			const postToolUseBase = normalized.hooks.PostToolUse.find((entry) => entry.matcher === "");
+			const stopBase = normalized.hooks.Stop.find((entry) => entry.matcher === "");
+
+			expect(preToolUseBase?.hooks[0]?.command).toBe(
+				'[ -z "$OVERSTORY_AGENT_NAME" ] && exit 0; overstory log tool-start --agent custom-agent --stdin --trace-id 42 --format json',
+			);
+			expect(postToolUseBase?.hooks[0]?.command).toBe(
+				'[ -z "$OVERSTORY_AGENT_NAME" ] && exit 0; overstory log tool-end --agent custom-agent --stdin --trace-id 84 --format json',
+			);
+			expect(stopBase?.hooks[0]?.command).toBe(
+				'[ -z "$OVERSTORY_AGENT_NAME" ] && exit 0; overstory log session-end --agent custom-agent --stdin --trace-id 126 --format json',
+			);
+		}
+	});
+
+	test("throws on malformed --agent argument instead of silently dropping options", () => {
+		const adapter = resolveHookAdapter("native");
+
+		expect(() =>
+			adapter.normalize(
+				{
+					hooks: {
+						PreToolUse: [
+							{
+								matcher: "",
+								hooks: [
+									{
+										type: "command",
+										command: "overstory log tool-start --agent",
+									},
+								],
+							},
+						],
+					},
+				},
+				{
+					agentName: "context-agent",
+					capability: "builder",
+					providerKind: "native",
+					target: "agent",
+				},
+			),
+		).toThrow("Unable to normalize overstory log command");
 	});
 });
