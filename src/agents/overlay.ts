@@ -1,7 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { AgentError } from "../errors.ts";
-import type { OverlayConfig } from "../types.ts";
+import type { OverlayConfig, RuntimeAdapter } from "../types.ts";
 
 /**
  * Resolve the path to the overlay template file.
@@ -241,7 +241,12 @@ export async function writeOverlay(
 	worktreePath: string,
 	config: OverlayConfig,
 	canonicalRoot: string,
+	runtime?: Pick<RuntimeAdapter, "metadata">,
 ): Promise<void> {
+	const sessionConfigDir = runtime?.metadata.sessionConfigDir ?? ".claude";
+	const overlayFile = runtime?.metadata.overlayFile ?? "CLAUDE.md";
+	const assignmentPath = runtime?.metadata.assignmentPath ?? ".claude/CLAUDE.md";
+
 	// Guard: never write agent overlays to the canonical project root.
 	// The project root's .claude/CLAUDE.md belongs to the orchestrator/user.
 	// Uses path comparison instead of file-existence heuristic to handle
@@ -249,19 +254,19 @@ export async function writeOverlay(
 	// and appears in every worktree checkout (overstory-p4st).
 	if (isCanonicalRoot(worktreePath, canonicalRoot)) {
 		throw new AgentError(
-			`Refusing to write overlay to canonical project root: ${worktreePath}. Agent overlays must target a worktree, not the orchestrator's root directory. This prevents overwriting the user's .claude/CLAUDE.md.`,
+			`Refusing to write overlay to canonical project root: ${worktreePath}. Agent overlays must target a worktree, not the orchestrator's root directory. This prevents overwriting the user's ${assignmentPath}.`,
 			{ agentName: config.agentName },
 		);
 	}
 
 	const content = await generateOverlay(config);
-	const claudeDir = join(worktreePath, ".claude");
-	const outputPath = join(claudeDir, "CLAUDE.md");
+	const runtimeDir = join(worktreePath, sessionConfigDir);
+	const outputPath = join(runtimeDir, overlayFile);
 
 	try {
-		await mkdir(claudeDir, { recursive: true });
+		await mkdir(runtimeDir, { recursive: true });
 	} catch (err) {
-		throw new AgentError(`Failed to create .claude/ directory at: ${claudeDir}`, {
+		throw new AgentError(`Failed to create runtime config directory at: ${runtimeDir}`, {
 			agentName: config.agentName,
 			cause: err instanceof Error ? err : undefined,
 		});

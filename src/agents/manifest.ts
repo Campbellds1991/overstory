@@ -306,8 +306,9 @@ export function resolveModel(
 	manifest: AgentManifest,
 	role: string,
 	fallback: string,
+	registry: ReturnType<typeof createProviderRegistry> = createProviderRegistry(),
 ): ResolvedModel {
-	const resolution = createProviderRegistry().resolveModel({
+	const resolution = registry.resolveModel({
 		config,
 		manifest,
 		role,

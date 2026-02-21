@@ -21,6 +21,7 @@ import { createBeadsClient } from "../beads/client.ts";
 import { loadConfig } from "../config.ts";
 import { AgentError, ValidationError } from "../errors.ts";
 import { createProviderRegistry } from "../providers/registry.ts";
+import { createRuntimeRegistry } from "../runtime/registry.ts";
 import { openSessionStore } from "../sessions/compat.ts";
 import type {
 	AgentManifest,
@@ -28,6 +29,7 @@ import type {
 	OverstoryConfig,
 	ProviderLaunchSpec,
 	ProviderRegistry,
+	RuntimeAdapter,
 } from "../types.ts";
 import {
 	createSession,
@@ -41,6 +43,7 @@ import { isRunningAsRoot } from "./sling.ts";
 /** Dependency injection for provider wiring in tests. */
 export interface SupervisorDeps {
 	_providers?: ProviderRegistry;
+	_runtime?: RuntimeAdapter;
 }
 
 /**
@@ -120,12 +123,12 @@ function parseFlags(args: string[]): {
 
 /** Resolve supervisor launch command/env/startup from provider registry. */
 export function resolveSupervisorLaunch(
-	registry: ProviderRegistry,
+	runtime: Pick<RuntimeAdapter, "buildLaunch">,
 	config: OverstoryConfig,
 	manifest: AgentManifest,
 	appendSystemPrompt?: string,
 ): ProviderLaunchSpec {
-	return registry.buildLaunch({
+	return runtime.buildLaunch({
 		config,
 		manifest,
 		role: "supervisor",
@@ -173,6 +176,7 @@ async function startSupervisor(args: string[], deps: SupervisorDeps = {}): Promi
 	const cwd = process.cwd();
 	const config = await loadConfig(cwd);
 	const providers = deps._providers ?? createProviderRegistry();
+	const runtime = deps._runtime ?? createRuntimeRegistry({ providers }).resolve(config);
 	const projectRoot = config.project.root;
 
 	// Validate bead exists and is workable (open or in_progress)
@@ -209,7 +213,7 @@ async function startSupervisor(args: string[], deps: SupervisorDeps = {}): Promi
 		}
 
 		// Deploy supervisor-specific hooks to the project root's .claude/ directory.
-		await deployHooks(projectRoot, flags.name, "supervisor");
+		await deployHooks(projectRoot, flags.name, "supervisor", { runtime });
 
 		// Create supervisor identity if first run
 		const identityBaseDir = join(projectRoot, ".overstory", "agents");
@@ -242,7 +246,7 @@ async function startSupervisor(args: string[], deps: SupervisorDeps = {}): Promi
 		if (await agentDefFile.exists()) {
 			appendSystemPrompt = await agentDefFile.text();
 		}
-		const launch = resolveSupervisorLaunch(providers, config, manifest, appendSystemPrompt);
+		const launch = resolveSupervisorLaunch(runtime, config, manifest, appendSystemPrompt);
 		const pid = await createSession(tmuxSession, projectRoot, launch.command, {
 			...launch.env,
 			OVERSTORY_AGENT_NAME: flags.name,

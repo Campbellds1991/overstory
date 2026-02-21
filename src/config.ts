@@ -37,6 +37,9 @@ export const DEFAULT_CONFIG: OverstoryConfig = {
 	providers: {
 		anthropic: { type: "native" },
 	},
+	runtime: {
+		name: "claude",
+	},
 	watchdog: {
 		tier0Enabled: true, // Tier 0: Mechanical daemon
 		tier0IntervalMs: 30_000,
@@ -456,6 +459,32 @@ function validateConfig(config: OverstoryConfig): void {
 				);
 			}
 		}
+	}
+
+	// runtime: validate runtime name when configured
+	if (config.runtime !== undefined) {
+		const runtimeVal = config.runtime as unknown;
+		if (runtimeVal === null || typeof runtimeVal !== "object") {
+			throw new ValidationError("runtime must be an object with a 'name' field", {
+				field: "runtime",
+				value: runtimeVal,
+			});
+		}
+		if (typeof config.runtime.name !== "string" || config.runtime.name.length === 0) {
+			throw new ValidationError("runtime.name must be a non-empty string", {
+				field: "runtime.name",
+				value: (runtimeVal as Record<string, unknown>).name,
+			});
+		}
+	}
+
+	const validRuntimeNames = ["claude", "codex"];
+	const runtimeName = config.runtime?.name ?? "claude";
+	if (!validRuntimeNames.includes(runtimeName)) {
+		throw new ValidationError(
+			`runtime.name must be one of: ${validRuntimeNames.join(", ")}`,
+			{ field: "runtime.name", value: runtimeName },
+		);
 	}
 
 	// models: validate each value — accepts aliases and provider-prefixed refs

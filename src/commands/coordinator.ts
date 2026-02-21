@@ -20,6 +20,7 @@ import { createManifestLoader } from "../agents/manifest.ts";
 import { loadConfig } from "../config.ts";
 import { AgentError, ValidationError } from "../errors.ts";
 import { createProviderRegistry } from "../providers/registry.ts";
+import { createRuntimeRegistry } from "../runtime/registry.ts";
 import { openSessionStore } from "../sessions/compat.ts";
 import { createRunStore } from "../sessions/store.ts";
 import type {
@@ -28,6 +29,7 @@ import type {
 	OverstoryConfig,
 	ProviderLaunchSpec,
 	ProviderRegistry,
+	RuntimeAdapter,
 } from "../types.ts";
 import { isProcessRunning } from "../watchdog/health.ts";
 import {
@@ -79,6 +81,7 @@ export interface CoordinatorDeps {
 		isRunning: () => Promise<boolean>;
 	};
 	_providers?: ProviderRegistry;
+	_runtime?: RuntimeAdapter;
 }
 
 /**
@@ -259,12 +262,12 @@ export function buildCoordinatorBeacon(): string {
 
 /** Resolve coordinator launch command/env/startup from provider registry. */
 export function resolveCoordinatorLaunch(
-	registry: ProviderRegistry,
+	runtime: Pick<RuntimeAdapter, "buildLaunch">,
 	config: OverstoryConfig,
 	manifest: AgentManifest,
 	appendSystemPrompt?: string,
 ): ProviderLaunchSpec {
-	return registry.buildLaunch({
+	return runtime.buildLaunch({
 		config,
 		manifest,
 		role: "coordinator",
@@ -319,6 +322,7 @@ async function startCoordinator(args: string[], deps: CoordinatorDeps = {}): Pro
 	const config = await loadConfig(cwd);
 	const projectRoot = config.project.root;
 	const providers = deps._providers ?? createProviderRegistry();
+	const runtime = deps._runtime ?? createRuntimeRegistry({ providers }).resolve(config);
 	const watchdog = deps._watchdog ?? createDefaultWatchdog(projectRoot);
 	const monitor = deps._monitor ?? createDefaultMonitor(projectRoot);
 	const tmuxSession = coordinatorTmuxSession(config.project.name);
@@ -352,7 +356,7 @@ async function startCoordinator(args: string[], deps: CoordinatorDeps = {}): Pro
 		// ensures they only activate when OVERSTORY_AGENT_NAME is set (i.e. for
 		// the coordinator's tmux session), so the user's own Claude Code session
 		// at the project root is unaffected.
-		await deployHooks(projectRoot, COORDINATOR_NAME, "coordinator");
+		await deployHooks(projectRoot, COORDINATOR_NAME, "coordinator", { runtime });
 
 		// Create coordinator identity if first run
 		const identityBaseDir = join(projectRoot, ".overstory", "agents");
@@ -386,7 +390,7 @@ async function startCoordinator(args: string[], deps: CoordinatorDeps = {}): Pro
 		if (await agentDefFile.exists()) {
 			appendSystemPrompt = await agentDefFile.text();
 		}
-		const launch = resolveCoordinatorLaunch(providers, config, manifest, appendSystemPrompt);
+		const launch = resolveCoordinatorLaunch(runtime, config, manifest, appendSystemPrompt);
 		const pid = await tmux.createSession(tmuxSession, projectRoot, launch.command, {
 			...launch.env,
 			OVERSTORY_AGENT_NAME: COORDINATOR_NAME,

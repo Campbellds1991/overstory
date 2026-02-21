@@ -38,6 +38,7 @@ describe("loadConfig", () => {
 		expect(config.mulch.enabled).toBe(true);
 		expect(config.mulch.primeFormat).toBe("markdown");
 		expect(config.logging.verbose).toBe(false);
+		expect(config.runtime?.name).toBe("claude");
 	});
 
 	test("sets project.name from directory name", async () => {
@@ -526,6 +527,23 @@ models:
 		}
 		expect(capturedStderr).not.toContain("WARNING");
 	});
+
+	test("accepts codex runtime", async () => {
+		await writeConfig(`
+runtime:
+  name: codex
+`);
+		const config = await loadConfig(tempDir);
+		expect(config.runtime?.name).toBe("codex");
+	});
+
+	test("rejects unknown runtime name", async () => {
+		await writeConfig(`
+runtime:
+  name: unknown
+`);
+		await expect(loadConfig(tempDir)).rejects.toThrow(ValidationError);
+	});
 });
 
 describe("resolveProjectRoot", () => {
@@ -645,6 +663,7 @@ describe("DEFAULT_CONFIG", () => {
 		expect(DEFAULT_CONFIG.watchdog).toBeDefined();
 		expect(DEFAULT_CONFIG.models).toBeDefined();
 		expect(DEFAULT_CONFIG.logging).toBeDefined();
+		expect(DEFAULT_CONFIG.runtime).toBeDefined();
 	});
 
 	test("has default providers with anthropic native", () => {
@@ -660,5 +679,6 @@ describe("DEFAULT_CONFIG", () => {
 		expect(DEFAULT_CONFIG.watchdog.tier0IntervalMs).toBe(30_000);
 		expect(DEFAULT_CONFIG.watchdog.staleThresholdMs).toBe(300_000);
 		expect(DEFAULT_CONFIG.watchdog.zombieThresholdMs).toBe(600_000);
+		expect(DEFAULT_CONFIG.runtime?.name).toBe("claude");
 	});
 });

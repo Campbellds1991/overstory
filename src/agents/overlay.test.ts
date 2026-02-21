@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentError } from "../errors.ts";
-import type { OverlayConfig } from "../types.ts";
+import type { OverlayConfig, RuntimeAdapter } from "../types.ts";
 import { generateOverlay, isCanonicalRoot, writeOverlay } from "./overlay.ts";
 
 const SAMPLE_BASE_DEFINITION = `# Builder Agent
@@ -381,6 +381,25 @@ describe("writeOverlay", () => {
 		const file = Bun.file(outputPath);
 		const exists = await file.exists();
 		expect(exists).toBe(true);
+	});
+
+	test("creates .codex/AGENTS.md when codex runtime metadata is provided", async () => {
+		const worktreePath = join(tempDir, "codex-worktree");
+		const config = makeConfig();
+		const codexRuntime: Pick<RuntimeAdapter, "metadata"> = {
+			metadata: {
+				sessionConfigDir: ".codex",
+				overlayFile: "AGENTS.md",
+				hooksFile: "settings.local.json",
+				assignmentPath: ".codex/AGENTS.md",
+				transcriptRootDir: ".codex/sessions",
+			},
+		};
+
+		await writeOverlay(worktreePath, config, "/nonexistent-canonical-root", codexRuntime);
+
+		const outputPath = join(worktreePath, ".codex", "AGENTS.md");
+		expect(await Bun.file(outputPath).exists()).toBe(true);
 	});
 
 	test("written file contains the overlay content", async () => {

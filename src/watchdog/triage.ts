@@ -2,21 +2,24 @@
  * Tier 1 AI-assisted failure classification for stalled agents.
  *
  * When an agent is detected as stalled, triage reads recent log entries and
- * uses Claude to classify the situation as recoverable, fatal, or long-running.
- * Falls back to "extend" if Claude is unavailable.
+ * uses the configured runtime CLI to classify the situation as recoverable,
+ * fatal, or long-running. Falls back to "extend" if the runtime is unavailable.
  */
 
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
+import { loadConfig } from "../config.ts";
 import { AgentError } from "../errors.ts";
+import { createRuntimeRegistry } from "../runtime/registry.ts";
+import type { RuntimeAdapter } from "../types.ts";
 
 /**
- * Triage a stalled agent by analyzing its recent log output with Claude.
+ * Triage a stalled agent by analyzing its recent log output with the configured runtime.
  *
  * Steps:
  * 1. Find the most recent session log directory for the agent
  * 2. Read the last 50 lines of session.log
- * 3. Ask Claude to classify the situation
+ * 3. Ask the runtime to classify the situation
  * 4. Parse the response to determine action
  *
  * @param options.agentName - Name of the agent to triage
@@ -30,6 +33,8 @@ export async function triageAgent(options: {
 	lastActivity: string;
 	/** Timeout in ms for the Claude subprocess. Defaults to 30_000 (30s). */
 	timeoutMs?: number;
+	/** Optional runtime override (primarily for tests/DI). */
+	runtime?: RuntimeAdapter;
 }): Promise<"retry" | "terminate" | "extend"> {
 	const { agentName, root, lastActivity, timeoutMs } = options;
 	const logsDir = join(root, ".overstory", "logs", agentName);
@@ -43,13 +48,24 @@ export async function triageAgent(options: {
 	}
 
 	const prompt = buildTriagePrompt(agentName, lastActivity, logContent);
+	const runtime = options.runtime ?? (await resolveTriageRuntime(root));
 
 	try {
-		const response = await spawnClaude(prompt, timeoutMs);
+		const response = await spawnRuntimeTriage(runtime, prompt, timeoutMs);
 		return classifyResponse(response);
 	} catch {
-		// Claude not available — default to extend (safe fallback)
+		// Runtime not available — default to extend (safe fallback)
 		return "extend";
+	}
+}
+
+async function resolveTriageRuntime(root: string): Promise<RuntimeAdapter> {
+	const runtimeRegistry = createRuntimeRegistry();
+	try {
+		const config = await loadConfig(root);
+		return runtimeRegistry.resolve(config);
+	} catch {
+		return runtimeRegistry.get("claude");
 	}
 }
 
@@ -123,17 +139,21 @@ export function buildTriagePrompt(
 const DEFAULT_TRIAGE_TIMEOUT_MS = 30_000;
 
 /**
- * Spawn Claude in non-interactive mode to analyze the log.
+ * Spawn the configured runtime in non-interactive mode to analyze the log.
  *
  * @param prompt - The analysis prompt
  * @param timeoutMs - Timeout in ms for the subprocess (default 30s)
- * @returns Claude's response text
- * @throws Error if claude is not installed, the process fails, or the timeout is reached
+ * @returns Runtime response text
+ * @throws Error if runtime is not installed, the process fails, or the timeout is reached
  */
-async function spawnClaude(prompt: string, timeoutMs?: number): Promise<string> {
+async function spawnRuntimeTriage(
+	runtime: Pick<RuntimeAdapter, "name" | "buildTriageCommand">,
+	prompt: string,
+	timeoutMs?: number,
+): Promise<string> {
 	const timeout = timeoutMs ?? DEFAULT_TRIAGE_TIMEOUT_MS;
 
-	const proc = Bun.spawn(["claude", "--print", "-p", prompt], {
+	const proc = Bun.spawn(runtime.buildTriageCommand(prompt), {
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -148,7 +168,9 @@ async function spawnClaude(prompt: string, timeoutMs?: number): Promise<string> 
 
 		if (exitCode !== 0) {
 			const stderr = await new Response(proc.stderr).text();
-			throw new AgentError(`Claude triage failed (exit ${exitCode}): ${stderr.trim()}`);
+			throw new AgentError(
+				`${runtime.name} triage failed (exit ${exitCode}): ${stderr.trim()}`,
+			);
 		}
 
 		return stdout.trim();

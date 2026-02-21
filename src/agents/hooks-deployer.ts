@@ -11,6 +11,7 @@ import {
 	type HookProviderKind,
 	type HookTarget,
 } from "./hooks-policy.ts";
+import type { RuntimeAdapter } from "../types.ts";
 
 /**
  * Capabilities that must never modify project files.
@@ -504,6 +505,7 @@ export interface DeployHooksOptions {
 	target?: HookTarget;
 	adapter?: HookAdapter;
 	policy?: HookPolicy;
+	runtime?: Pick<RuntimeAdapter, "metadata">;
 }
 
 export function normalizeHookConfig(
@@ -552,6 +554,8 @@ export async function deployHooks(
 	};
 	const adapter = options.adapter ?? resolveHookAdapter(providerKind);
 	const policy = options.policy ?? DEFAULT_HOOK_POLICY;
+	const runtimeConfigDir = options.runtime?.metadata.sessionConfigDir ?? ".claude";
+	const runtimeHooksFile = options.runtime?.metadata.hooksFile ?? "settings.local.json";
 
 	const templatePath = getTemplatePath();
 	const file = Bun.file(templatePath);
@@ -585,13 +589,13 @@ export async function deployHooks(
 	const finalConfig = policy.apply(normalized, context);
 	const finalContent = `${JSON.stringify(finalConfig, null, "\t")}\n`;
 
-	const claudeDir = join(worktreePath, ".claude");
-	const outputPath = join(claudeDir, "settings.local.json");
+	const runtimeDir = join(worktreePath, runtimeConfigDir);
+	const outputPath = join(runtimeDir, runtimeHooksFile);
 
 	try {
-		await mkdir(claudeDir, { recursive: true });
+		await mkdir(runtimeDir, { recursive: true });
 	} catch (err) {
-		throw new AgentError(`Failed to create .claude/ directory at: ${claudeDir}`, {
+		throw new AgentError(`Failed to create runtime config directory at: ${runtimeDir}`, {
 			agentName,
 			cause: err instanceof Error ? err : undefined,
 		});

@@ -30,6 +30,7 @@ import { loadConfig } from "../config.ts";
 import { AgentError, HierarchyError, ValidationError } from "../errors.ts";
 import { createMulchClient } from "../mulch/client.ts";
 import { createProviderRegistry } from "../providers/registry.ts";
+import { createRuntimeRegistry } from "../runtime/registry.ts";
 import { openSessionStore } from "../sessions/compat.ts";
 import { createRunStore } from "../sessions/store.ts";
 import type {
@@ -39,6 +40,7 @@ import type {
 	OverlayConfig,
 	ProviderLaunchSpec,
 	ProviderRegistry,
+	RuntimeAdapter,
 } from "../types.ts";
 import { createWorktree } from "../worktree/manager.ts";
 import { createSession, sendKeys, waitForTuiReady } from "../worktree/tmux.ts";
@@ -46,6 +48,7 @@ import { createSession, sendKeys, waitForTuiReady } from "../worktree/tmux.ts";
 /** Dependency injection for provider wiring in tests. */
 export interface SlingDeps {
 	_providers?: ProviderRegistry;
+	_runtime?: RuntimeAdapter;
 }
 
 /**
@@ -108,6 +111,7 @@ export interface BeaconOptions {
 	taskId: string;
 	parentAgent: string | null;
 	depth: number;
+	assignmentPath?: string;
 }
 
 /**
@@ -129,10 +133,11 @@ export interface BeaconOptions {
 export function buildBeacon(opts: BeaconOptions): string {
 	const timestamp = new Date().toISOString();
 	const parent = opts.parentAgent ?? "none";
+	const assignmentPath = opts.assignmentPath ?? ".claude/CLAUDE.md";
 	const parts = [
 		`[OVERSTORY] ${opts.agentName} (${opts.capability}) ${timestamp} task:${opts.taskId}`,
 		`Depth: ${opts.depth} | Parent: ${parent}`,
-		`Startup: read .claude/CLAUDE.md, run mulch prime, check mail (overstory mail check --agent ${opts.agentName}), then begin task ${opts.taskId}`,
+		`Startup: read ${assignmentPath}, run mulch prime, check mail (overstory mail check --agent ${opts.agentName}), then begin task ${opts.taskId}`,
 	];
 	return parts.join(" — ");
 }
@@ -184,13 +189,13 @@ export function validateHierarchy(
 
 /** Resolve sling launch command/env/startup from provider registry. */
 export function resolveSlingLaunch(
-	registry: ProviderRegistry,
+	runtime: Pick<RuntimeAdapter, "buildLaunch">,
 	config: OverstoryConfig,
 	manifest: AgentManifest,
 	capability: string,
 	fallback: string,
 ): ProviderLaunchSpec {
-	return registry.buildLaunch({
+	return runtime.buildLaunch({
 		config,
 		manifest,
 		role: capability,
@@ -295,6 +300,7 @@ export async function slingCommand(args: string[], deps: SlingDeps = {}): Promis
 	const cwd = process.cwd();
 	const config = await loadConfig(cwd);
 	const providers = deps._providers ?? createProviderRegistry();
+	const runtime = deps._runtime ?? createRuntimeRegistry({ providers }).resolve(config);
 
 	// 2. Validate depth limit
 	// Hierarchy: orchestrator(0) -> lead(1) -> specialist(2)
@@ -451,7 +457,7 @@ export async function slingCommand(args: string[], deps: SlingDeps = {}): Promis
 		};
 
 		try {
-			await writeOverlay(worktreePath, overlayConfig, config.project.root);
+			await writeOverlay(worktreePath, overlayConfig, config.project.root, runtime);
 		} catch (err) {
 			// Clean up the orphaned worktree created in step 7 (overstory-p4st)
 			try {
@@ -468,7 +474,7 @@ export async function slingCommand(args: string[], deps: SlingDeps = {}): Promis
 		}
 
 		// 9. Deploy hooks config (capability-specific guards)
-		await deployHooks(worktreePath, name, capability);
+		await deployHooks(worktreePath, name, capability, { runtime });
 
 		// 10. Claim beads issue
 		if (config.beads.enabled) {
@@ -495,7 +501,7 @@ export async function slingCommand(args: string[], deps: SlingDeps = {}): Promis
 
 		// 12. Create tmux session running claude in interactive mode
 		const tmuxSessionName = `overstory-${config.project.name}-${name}`;
-		const launch = resolveSlingLaunch(providers, config, manifest, capability, agentDef.model);
+		const launch = resolveSlingLaunch(runtime, config, manifest, capability, agentDef.model);
 		const pid = await createSession(tmuxSessionName, worktreePath, launch.command, {
 			...launch.env,
 			OVERSTORY_AGENT_NAME: name,
@@ -551,6 +557,7 @@ export async function slingCommand(args: string[], deps: SlingDeps = {}): Promis
 			taskId,
 			parentAgent,
 			depth,
+			assignmentPath: runtime.metadata.assignmentPath,
 		});
 		await sendKeys(tmuxSessionName, beacon);
 

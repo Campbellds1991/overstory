@@ -79,6 +79,33 @@ export interface ProviderRegistry {
 	buildLaunch(input: BuildProviderLaunchInput): ProviderLaunchSpec;
 }
 
+/** Supported interactive runtimes for agent sessions. */
+export type RuntimeName = "claude" | "codex";
+
+/** Runtime-specific filesystem and transcript metadata. */
+export interface RuntimeMetadata {
+	sessionConfigDir: string;
+	overlayFile: string;
+	hooksFile: string;
+	assignmentPath: string;
+	transcriptRootDir: string;
+}
+
+/** Runtime adapter contract for launch construction and runtime-side operations. */
+export interface RuntimeAdapter {
+	readonly name: RuntimeName;
+	readonly metadata: RuntimeMetadata;
+	buildLaunch(input: BuildProviderLaunchInput): ProviderLaunchSpec;
+	buildTriageCommand(prompt: string): string[];
+	resolveTranscriptProjectDir(homeDir: string, projectKey: string): string;
+}
+
+/** Runtime registry contract for resolving runtime adapters from config. */
+export interface RuntimeRegistry {
+	get(name: RuntimeName): RuntimeAdapter;
+	resolve(config: OverstoryConfig): RuntimeAdapter;
+}
+
 // === Project Configuration ===
 
 export interface OverstoryConfig {
@@ -110,6 +137,9 @@ export interface OverstoryConfig {
 		reimagineEnabled: boolean;
 	};
 	providers: Record<string, ProviderConfig>;
+	runtime?: {
+		name: RuntimeName;
+	};
 	watchdog: {
 		tier0Enabled: boolean; // Tier 0: Mechanical daemon (heartbeat, tmux/pid liveness)
 		tier0IntervalMs: number; // Default 30_000

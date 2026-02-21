@@ -1109,6 +1109,27 @@ describe("costsCommand", () => {
 			expect(parsed.error).toBe("no_transcript");
 		});
 
+		test("--self uses codex transcript expectation when runtime is codex", async () => {
+			await Bun.write(
+				join(tempDir, ".overstory", "config.yaml"),
+				[
+					"project:",
+					"  name: test",
+					`  root: ${tempDir}`,
+					"  canonicalBranch: main",
+					"runtime:",
+					"  name: codex",
+				].join("\n"),
+			);
+			process.env.HOME = tempHome;
+
+			await costsCommand(["--self"]);
+			const out = output();
+
+			expect(out).toContain("No orchestrator transcript found");
+			expect(out).toContain("~/.codex/sessions");
+		});
+
 		test("--self in help text", async () => {
 			await costsCommand(["--help"]);
 			const out = output();
