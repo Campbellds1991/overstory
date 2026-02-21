@@ -6,15 +6,16 @@
  * Use --self to parse the current orchestrator session's transcript directly.
  */
 
-import { readdir, stat } from "node:fs/promises";
+import { readdir, realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { loadConfig } from "../config.ts";
 import { ValidationError } from "../errors.ts";
 import { color } from "../logging/color.ts";
 import { createMetricsStore } from "../metrics/store.ts";
 import { estimateCost, parseTranscriptUsage } from "../metrics/transcript.ts";
+import { createRuntimeRegistry } from "../runtime/registry.ts";
 import { openSessionStore } from "../sessions/compat.ts";
-import type { SessionMetrics } from "../types.ts";
+import type { RuntimeAdapter, SessionMetrics } from "../types.ts";
 
 /**
  * Parse a named flag value from args.
@@ -54,21 +55,15 @@ function padLeft(str: string, width: number): string {
 	return str.length >= width ? str : " ".repeat(width - str.length) + str;
 }
 
-/**
- * Discover the orchestrator's Claude Code transcript JSONL file.
- *
- * Scans ~/.claude/projects/{project-key}/ for JSONL files and returns
- * the most recently modified one, corresponding to the current orchestrator session.
- *
- * @param projectRoot - Absolute path to the project root
- * @returns Absolute path to the most recent transcript, or null if none found
- */
-async function discoverOrchestratorTranscript(projectRoot: string): Promise<string | null> {
+async function discoverClaudeTranscript(
+	projectRoot: string,
+	runtime: Pick<RuntimeAdapter, "resolveTranscriptProjectDir">,
+): Promise<string | null> {
 	const homeDir = process.env.HOME ?? "";
 	if (homeDir.length === 0) return null;
 
 	const projectKey = projectRoot.replace(/\//g, "-");
-	const projectDir = join(homeDir, ".claude", "projects", projectKey);
+	const projectDir = runtime.resolveTranscriptProjectDir(homeDir, projectKey);
 
 	let entries: string[];
 	try {
@@ -97,6 +92,139 @@ async function discoverOrchestratorTranscript(projectRoot: string): Promise<stri
 	}
 
 	return bestPath;
+}
+
+async function collectCodexTranscriptCandidates(rootDir: string): Promise<string[]> {
+	const files: Array<{ path: string; mtimeMs: number }> = [];
+
+	let years;
+	try {
+		years = await readdir(rootDir, { withFileTypes: true });
+	} catch {
+		return [];
+	}
+
+	for (const year of years) {
+		if (!year.isDirectory()) continue;
+		const yearDir = join(rootDir, year.name);
+		let months;
+		try {
+			months = await readdir(yearDir, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+
+		for (const month of months) {
+			if (!month.isDirectory()) continue;
+			const monthDir = join(yearDir, month.name);
+			let days;
+			try {
+				days = await readdir(monthDir, { withFileTypes: true });
+			} catch {
+				continue;
+			}
+
+			for (const day of days) {
+				if (!day.isDirectory()) continue;
+				const dayDir = join(monthDir, day.name);
+				let entries;
+				try {
+					entries = await readdir(dayDir, { withFileTypes: true });
+				} catch {
+					continue;
+				}
+
+				for (const entry of entries) {
+					if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+					const fullPath = join(dayDir, entry.name);
+					try {
+						const fileStat = await stat(fullPath);
+						files.push({ path: fullPath, mtimeMs: fileStat.mtimeMs });
+					} catch {
+						// Skip unreadable files
+					}
+				}
+			}
+		}
+	}
+
+	files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+	return files.map((f) => f.path);
+}
+
+async function safeRealpath(path: string): Promise<string> {
+	try {
+		return await realpath(path);
+	} catch {
+		return path;
+	}
+}
+
+async function codexTranscriptMatchesProject(filePath: string, projectRoot: string): Promise<boolean> {
+	let text: string;
+	try {
+		text = await Bun.file(filePath).text();
+	} catch {
+		return false;
+	}
+
+	const firstLine = text.split("\n")[0] ?? "";
+	if (firstLine.length === 0) return false;
+
+	try {
+		const parsed = JSON.parse(firstLine) as {
+			type?: string;
+			payload?: { cwd?: unknown };
+		};
+		if (parsed.type !== "session_meta") return false;
+		const cwd = parsed.payload?.cwd;
+		if (typeof cwd !== "string" || cwd.length === 0) return false;
+
+		const [expected, expectedReal, actual, actualReal] = await Promise.all([
+			Promise.resolve(projectRoot),
+			safeRealpath(projectRoot),
+			Promise.resolve(cwd),
+			safeRealpath(cwd),
+		]);
+
+		return expected === actual || expected === actualReal || expectedReal === actual || expectedReal === actualReal;
+	} catch {
+		return false;
+	}
+}
+
+async function discoverCodexTranscript(projectRoot: string, transcriptRootDir: string): Promise<string | null> {
+	const homeDir = process.env.HOME ?? "";
+	if (homeDir.length === 0) return null;
+
+	const rootDir = join(homeDir, transcriptRootDir);
+	const candidates = await collectCodexTranscriptCandidates(rootDir);
+	for (const candidate of candidates) {
+		if (await codexTranscriptMatchesProject(candidate, projectRoot)) {
+			return candidate;
+		}
+	}
+	return null;
+}
+
+/**
+ * Discover the orchestrator transcript JSONL file for the active runtime.
+ *
+ * Claude runtime:
+ * - Scans ~/.claude/projects/{project-key}/ and picks the most recent JSONL.
+ *
+ * Codex runtime:
+ * - Scans ~/.codex/sessions/YYYY/MM/DD/*.jsonl by newest mtime first.
+ * - Selects the newest file whose first session_meta record cwd matches projectRoot.
+ */
+async function discoverOrchestratorTranscript(
+	projectRoot: string,
+	runtime: Pick<RuntimeAdapter, "name" | "metadata" | "resolveTranscriptProjectDir">,
+): Promise<string | null> {
+	if (runtime.name === "codex") {
+		return discoverCodexTranscript(projectRoot, runtime.metadata.transcriptRootDir);
+	}
+	return discoverClaudeTranscript(projectRoot, runtime);
 }
 
 /** Aggregate totals from a list of SessionMetrics. */
@@ -283,21 +411,24 @@ export async function costsCommand(args: string[]): Promise<void> {
 
 	const cwd = process.cwd();
 	const config = await loadConfig(cwd);
+	const runtime = createRuntimeRegistry().resolve(config);
 	const overstoryDir = join(config.project.root, ".overstory");
 
 	// Handle --self flag (early return for self-scan)
 	if (self) {
-		const transcriptPath = await discoverOrchestratorTranscript(config.project.root);
+		const transcriptPath = await discoverOrchestratorTranscript(config.project.root, runtime);
 		if (!transcriptPath) {
+			const expectedPath =
+				runtime.name === "codex"
+					? "~/.codex/sessions/YYYY/MM/DD/*.jsonl (matching session_meta cwd)"
+					: "~/.claude/projects/{project-key}/*.jsonl";
 			if (json) {
 				process.stdout.write(
 					JSON.stringify({ error: "no_transcript", message: "No orchestrator transcript found" }) +
 						"\n",
 				);
 			} else {
-				process.stdout.write(
-					"No orchestrator transcript found.\nExpected at: ~/.claude/projects/{project-key}/*.jsonl\n",
-				);
+				process.stdout.write(`No orchestrator transcript found.\nExpected at: ${expectedPath}\n`);
 			}
 			return;
 		}

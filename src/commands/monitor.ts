@@ -21,6 +21,7 @@ import { createManifestLoader } from "../agents/manifest.ts";
 import { loadConfig } from "../config.ts";
 import { AgentError, ValidationError } from "../errors.ts";
 import { createProviderRegistry } from "../providers/registry.ts";
+import { createRuntimeRegistry } from "../runtime/registry.ts";
 import { openSessionStore } from "../sessions/compat.ts";
 import type {
 	AgentManifest,
@@ -28,6 +29,7 @@ import type {
 	OverstoryConfig,
 	ProviderLaunchSpec,
 	ProviderRegistry,
+	RuntimeAdapter,
 } from "../types.ts";
 import {
 	createSession,
@@ -41,6 +43,7 @@ import { isRunningAsRoot } from "./sling.ts";
 /** Dependency injection for provider wiring in tests. */
 export interface MonitorDeps {
 	_providers?: ProviderRegistry;
+	_runtime?: RuntimeAdapter;
 }
 
 /** Default monitor agent name. */
@@ -70,12 +73,12 @@ export function buildMonitorBeacon(): string {
 
 /** Resolve monitor launch command/env/startup from provider registry. */
 export function resolveMonitorLaunch(
-	registry: ProviderRegistry,
+	runtime: Pick<RuntimeAdapter, "buildLaunch">,
 	config: OverstoryConfig,
 	manifest: AgentManifest,
 	appendSystemPrompt?: string,
 ): ProviderLaunchSpec {
-	return registry.buildLaunch({
+	return runtime.buildLaunch({
 		config,
 		manifest,
 		role: "monitor",
@@ -118,6 +121,7 @@ async function startMonitor(args: string[], deps: MonitorDeps = {}): Promise<voi
 	const cwd = process.cwd();
 	const config = await loadConfig(cwd);
 	const providers = deps._providers ?? createProviderRegistry();
+	const runtime = deps._runtime ?? createRuntimeRegistry({ providers }).resolve(config);
 
 	// Gate on tier2Enabled config flag
 	if (!config.watchdog.tier2Enabled) {
@@ -156,7 +160,7 @@ async function startMonitor(args: string[], deps: MonitorDeps = {}): Promise<voi
 		// Deploy monitor-specific hooks to the project root's .claude/ directory.
 		// The monitor gets the same structural enforcement as other non-implementation
 		// agents (Write/Edit/NotebookEdit blocked, dangerous bash commands blocked).
-		await deployHooks(projectRoot, MONITOR_NAME, "monitor");
+		await deployHooks(projectRoot, MONITOR_NAME, "monitor", { runtime });
 
 		// Create monitor identity if first run
 		const identityBaseDir = join(projectRoot, ".overstory", "agents");
@@ -188,7 +192,7 @@ async function startMonitor(args: string[], deps: MonitorDeps = {}): Promise<voi
 		if (await agentDefFile.exists()) {
 			appendSystemPrompt = await agentDefFile.text();
 		}
-		const launch = resolveMonitorLaunch(providers, config, manifest, appendSystemPrompt);
+		const launch = resolveMonitorLaunch(runtime, config, manifest, appendSystemPrompt);
 		const pid = await createSession(tmuxSession, projectRoot, launch.command, {
 			...launch.env,
 			OVERSTORY_AGENT_NAME: MONITOR_NAME,

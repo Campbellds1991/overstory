@@ -404,6 +404,15 @@ describe("buildBeacon", () => {
 		expect(beacon).toContain("begin task overstory-xyz");
 	});
 
+	test("supports runtime-specific assignment path in startup instructions", () => {
+		const beacon = buildBeacon(
+			makeBeaconOpts({
+				assignmentPath: ".codex/AGENTS.md",
+			}),
+		);
+		expect(beacon).toContain("read .codex/AGENTS.md");
+	});
+
 	test("uses agent name in mail check command", () => {
 		const beacon = buildBeacon(makeBeaconOpts({ agentName: "reviewer-beta" }));
 
